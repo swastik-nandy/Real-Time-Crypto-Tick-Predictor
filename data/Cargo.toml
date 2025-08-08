@@ -3,6 +3,11 @@ name = "data_collection"
 version = "0.1.0"
 edition = "2024"
 
+[package]
+name = "data_collection"
+version = "0.1.0"
+edition = "2024"
+
 [dependencies]
 chrono = "0.4.41"
 dotenv = "0.15.0"
@@ -14,10 +19,9 @@ tokio = { version = "1.38", features = ["full"] }
 tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
 url = "2.5.4"
 
-# Redis with RustLS TLS enabled
-redis = { version = "0.25", features = ["tokio-comp", "tls-rustls"] }
+# Redis with Rustls TLS over Tokio
+redis = { version = "0.25", features = ["tokio-rustls-comp", "tls-rustls"] }
 
-# Postgres + chrono date/time support
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 postgres-types = { version = "0.2", features = ["with-chrono-0_4"] }
 
@@ -28,3 +32,4 @@ path = "src/bin/websocket.rs"
 [[bin]]
 name = "trigger"
 path = "src/bin/trigger.rs"
+
