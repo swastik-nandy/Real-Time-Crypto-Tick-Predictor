@@ -1,5 +1,5 @@
 # ------------------ Stage 1: Build Rust binaries -----------------------
-FROM rust:1.77-slim AS builder
+FROM rust:1.88.0-slim AS builder
 
 # Set working directory inside container
 WORKDIR /app
