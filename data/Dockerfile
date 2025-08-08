@@ -1,50 +1,35 @@
 # ------------------ Stage 1: Build Rust binaries -----------------------
 FROM rust:1.88.0-slim AS builder
 
-# Set working directory inside container
 WORKDIR /app
-
-# Copy everything from data/ into container (assuming Dockerfile lives in data/)
 COPY . .
 
-# Install required tools for compiling Redis/Postgres dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Build Rust binaries (trigger.rs and websocket.rs should be in src/bin/)
 RUN cargo build --release
 
 
 # ------------------ Stage 2: Runtime Image -----------------------------
 FROM python:3.11-slim
 
-# Set working directory for runtime container
 WORKDIR /app
 
-# Copy built binaries from builder
 COPY --from=builder /app/target/release/trigger ./trigger
 COPY --from=builder /app/target/release/websocket ./websocket
-
-# Copy scripts, requirements, etc.
 COPY . .
 
-# Install runtime tools
-# - git: for push.py logic
-# - ca-certificates: TLS trust store (required for rediss:// and HTTPS)
-# - libssl-dev: native-tls/openSSL runtime for websocket/native-tls paths
 RUN apt-get update && apt-get install -y \
     git \
     ca-certificates \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies (used in push.py and health checks)
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Environment setup
 ENV PYTHONUNBUFFERED=1
 ENV LOG_LEVEL=DEBUG
 
@@ -55,10 +40,49 @@ CMD ["sh", "-c", "\
     echo '🐍 Python:'; python3 --version; \
     echo '🦀 Rust binaries in:'; ls -lh trigger websocket; \
     echo '📦 Python packages:'; pip list; \
-    echo '🔍 Checking Redis connection...'; \
-    python3 -c 'import os, redis; print(redis.Redis.from_url(os.environ.get(\"REDIS_URL\")).ping())'; \
-    echo '🔍 Checking Postgres connection...'; \
-    python3 -c 'import asyncpg, asyncio, os; d=os.environ.get(\"DATABASE_URL\",\" \").replace(\"postgresql+asyncpg://\",\"postgresql://\"); asyncio.run(asyncpg.connect(d))'; \
+    echo '=== ENV CHECK ==='; \
+    env | grep -E 'DATABASE_URL|REDIS_URL' || true; \
+    python3 - <<'PY'\n\
+import os, re, sys, asyncio, asyncpg, redis\n\
+# Mask passwords when printing\n\
+def mask(url):\n\
+    return re.sub(r':[^@]+@', ':***@', url)\n\
+\n\
+# --- Check DATABASE_URL ---\n\
+pg_url = os.getenv('DATABASE_URL')\n\
+if not pg_url:\n\
+    print('❌ DATABASE_URL is missing or empty!', file=sys.stderr)\n\
+    sys.exit(1)\n\
+print('[env] DATABASE_URL =', mask(pg_url))\n\
+pg_url = pg_url.replace('postgresql+asyncpg://', 'postgresql://')\n\
+\n\
+# --- Check REDIS_URL ---\n\
+rd_url = os.getenv('REDIS_URL')\n\
+if not rd_url:\n\
+    print('❌ REDIS_URL is missing or empty!', file=sys.stderr)\n\
+    sys.exit(1)\n\
+print('[env] REDIS_URL =', mask(rd_url))\n\
+\n\
+# --- Redis connection check ---\n\
+try:\n\
+    r = redis.Redis.from_url(rd_url)\n\
+    print('[health] Redis ping ->', r.ping())\n\
+except Exception as e:\n\
+    print('❌ Redis connection failed:', e, file=sys.stderr)\n\
+    sys.exit(1)\n\
+\n\
+# --- Postgres connection check ---\n\
+async def check_pg():\n\
+    try:\n\
+        conn = await asyncpg.connect(pg_url)\n\
+        await conn.close()\n\
+        print('[health] Postgres OK')\n\
+    except Exception as e:\n\
+        print('❌ Postgres connection failed:', e, file=sys.stderr)\n\
+        sys.exit(1)\n\
+\n\
+asyncio.run(check_pg())\n\
+PY\n\
     echo '🚀 Launching trigger and websocket...'; \
     ./trigger & \
     ./websocket"]

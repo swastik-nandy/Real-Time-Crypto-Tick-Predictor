@@ -2,4 +2,6 @@ target/
 .git/
 .vscode/
 __pycache__/
-*.pyc
+*.pyc.
+.env
+
