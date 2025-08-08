@@ -13,7 +13,12 @@ use redis::AsyncCommands;
 use tokio::{
     time::{sleep, timeout, Instant},
 };
-use tokio_postgres::{NoTls, types::ToSql};
+use tokio_postgres::types::ToSql;
+
+// --- TLS for Postgres via Rustls ---
+use postgres_rustls::MakeRustlsConnect;
+use rustls::{ClientConfig, RootCertStore};
+use rustls_native_certs::load_native_certs;
 
 /// Tunables
 const FETCH_INTERVAL_SECS: u64 = 10;
@@ -29,14 +34,26 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
     let redis_url = env::var("REDIS_URL").expect("REDIS_URL not set");
     let pg_url = env::var("DATABASE_URL").expect("Postgres URL not set");
 
-    // Connections
+    // --- Connect to Redis (TLS already enabled via Cargo.toml rustls feature) ---
     let redis_client = redis::Client::open(redis_url).expect("Invalid Redis URL");
     let mut redis = redis_client
         .get_multiplexed_async_connection()
         .await
         .expect("Redis connection failed");
 
-    let (pg_client, pg_connection) = tokio_postgres::connect(&pg_url, NoTls)
+    // --- Prepare TLS for Postgres ---
+    let mut root_store = RootCertStore::empty();
+    for cert in load_native_certs().expect("Could not load platform certs") {
+        root_store.add(cert).unwrap();
+    }
+    let tls_config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let tls = MakeRustlsConnect::new(tls_config);
+
+    // --- Connect to Postgres with TLS ---
+    let (pg_client, pg_connection) = tokio_postgres::connect(&pg_url, tls)
         .await
         .expect("Postgres connection failed");
 
@@ -46,7 +63,7 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
         }
     });
 
-    // Symbol → id map 
+    // Load stock ID map
     let rows = pg_client
         .query("SELECT id, symbol FROM stocks", &[])
         .await
@@ -68,7 +85,7 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
 
         let loop_start = Instant::now();
 
-        // 1) Get symbols
+        // 1) Get symbols from Redis
         let symbols: Vec<String> = match timeout(REDIS_OP_TIMEOUT, redis.smembers(SYMBOLS_KEY)).await {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => { eprintln!("❌ Redis smembers: {e}"); coop_sleep(&fetcher_running, Duration::from_secs(1)).await; continue; }
@@ -90,7 +107,7 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
 
         if !fetcher_running.load(Ordering::Relaxed) { break; }
 
-        // 3) Build batch
+        // 3) Build batch insert
         let mut values: Vec<Box<dyn ToSql + Send + Sync>> = Vec::new();
         let mut placeholders = Vec::new();
         let mut idx = 1;
@@ -140,7 +157,7 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
 
         if !fetcher_running.load(Ordering::Relaxed) { break; }
 
-        // 4) Insert batch
+        // 4) Insert batch into Postgres
         if !placeholders.is_empty() {
             let query = format!(
                 "INSERT INTO stock_price_history \
@@ -149,7 +166,6 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
                 placeholders.join(", ")
             );
 
-            // FIXED HERE: cast from Send+Sync to Sync
             let params: Vec<&(dyn ToSql + Sync)> =
                 values.iter().map(|v| v.as_ref() as &(dyn ToSql + Sync)).collect();
 
