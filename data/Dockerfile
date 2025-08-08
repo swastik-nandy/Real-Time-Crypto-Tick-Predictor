@@ -4,7 +4,7 @@ FROM rust:1.88.0-slim AS builder
 # Set working directory inside container
 WORKDIR /app
 
-# Copy everything from data/ into container
+# Copy everything from data/ into container (assuming Dockerfile lives in data/)
 COPY . .
 
 # Install required tools for compiling Redis/Postgres dependencies
@@ -28,15 +28,20 @@ WORKDIR /app
 COPY --from=builder /app/target/release/trigger ./trigger
 COPY --from=builder /app/target/release/websocket ./websocket
 
-# Copy scripts, .env, and push.py-related files
+# Copy scripts, requirements, etc.
 COPY . .
 
-# Install runtime tools (for GitHub push)
+# Install runtime tools
+# - git: for push.py logic
+# - ca-certificates: TLS trust store (required for rediss:// and HTTPS)
+# - libssl-dev: native-tls/openSSL runtime for websocket/native-tls paths
 RUN apt-get update && apt-get install -y \
     git \
+    ca-certificates \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies (used in push.py)
+# Install Python dependencies (used in push.py and health checks)
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Environment setup
@@ -53,7 +58,7 @@ CMD ["sh", "-c", "\
     echo '🔍 Checking Redis connection...'; \
     python3 -c 'import os, redis; print(redis.Redis.from_url(os.environ.get(\"REDIS_URL\")).ping())'; \
     echo '🔍 Checking Postgres connection...'; \
-    python3 -c 'import asyncpg, asyncio, os; asyncio.run(asyncpg.connect(os.environ[\"DATABASE_URL\"]))'; \
+    python3 -c 'import asyncpg, asyncio, os; d=os.environ.get(\"DATABASE_URL\",\" \").replace(\"postgresql+asyncpg://\",\"postgresql://\"); asyncio.run(asyncpg.connect(d))'; \
     echo '🚀 Launching trigger and websocket...'; \
     ./trigger & \
     ./websocket"]
