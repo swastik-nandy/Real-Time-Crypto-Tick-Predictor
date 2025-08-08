@@ -39,13 +39,13 @@ async def fetch_and_store(redis, pg_pool):
 
     pipe = redis.pipeline()
     for symbol in symbols:
-        pipe.get(f"{TRADE_KEY_PREFIX}{symbol}")  # Pull full trade info
+        pipe.get(f"{TRADE_KEY_PREFIX}{symbol}")
     results = await pipe.execute()
 
     rows = []
     for symbol, raw_trade in zip(symbols, results):
         if raw_trade is None:
-            logger.debug(f"No trade data found in Redis for {symbol}, skipping.")
+            logger.debug(f"No trade data for {symbol}, skipping.")
             continue
         try:
             trade_info = json.loads(raw_trade)
@@ -58,9 +58,9 @@ async def fetch_and_store(redis, pg_pool):
                 if stock_id:
                     rows.append((stock_id, price, trade_time))
                 else:
-                    logger.warning(f"Stock symbol {symbol} not found in DB, skipping.")
+                    logger.warning(f"Stock symbol {symbol} not found in DB.")
         except Exception as e:
-            logger.error(f"[ERROR] Problem with {symbol}: {e}")
+            logger.error(f"[ERROR] Issue with {symbol}: {e}")
 
     if rows:
         try:
@@ -72,11 +72,11 @@ async def fetch_and_store(redis, pg_pool):
                     """,
                     rows
                 )
-            logger.info(f"✅ Inserted {len(rows)} rows with real trade timestamps")
+            logger.info(f"✅ Inserted {len(rows)} trades")
         except Exception as e:
             logger.error(f"[ERROR] Insert failed: {e}")
     else:
-        logger.info("No rows to insert in this cycle.")
+        logger.info("No rows to insert.")
 
 # -------------------- MAIN LOOP ---------------------
 async def run_fetcher():
@@ -85,18 +85,16 @@ async def run_fetcher():
     redis = Redis.from_url(REDIS_URL, decode_responses=True)
     pg_pool = await asyncpg.create_pool(DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://"))
 
-    start_time = time(0, 32)
-    end_time = time(23, 59, 50)
-
     while True:
         now = datetime.utcnow()
-        if now.time() < start_time:
-            logger.debug("⏳ Waiting for fetch window to open...")
-            await asyncio.sleep(1)
+        current_time = now.time()
+
+        # Pause during 05:00 to 05:05 UTC
+        
+        if time(5, 0) <= current_time < time(5, 5):
+            logger.info("⏸️ Skipping fetch — cleaner window (05:00–05:05 UTC)")
+            await asyncio.sleep(60)
             continue
-        if now.time() >= end_time:
-            logger.info(f"🛑 Fetch window closed at {now.time()}")
-            break
 
         start = pytime.time()
         await fetch_and_store(redis, pg_pool)
@@ -105,7 +103,7 @@ async def run_fetcher():
         if elapsed < FETCH_INTERVAL:
             await asyncio.sleep(FETCH_INTERVAL - elapsed)
         else:
-            logger.warning(f"⚠️ Took {elapsed:.2f}s — skipping dynamic sleep")
+            logger.warning(f"⚠️ Fetch took {elapsed:.2f}s — skipping delay")
             await asyncio.sleep(FETCH_INTERVAL)
 
     await redis.close()

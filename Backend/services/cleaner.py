@@ -40,7 +40,7 @@ async def run_cleanup():
             start = datetime.utcnow()
 
             # --- stock_price_history 
-            if time(0, 5) <= current_time <= time(0, 30):
+            if time(5, 2) <= current_time <= time(5, 5):
                 if await table_not_empty(conn, "stock_price_history"):
                     print("🧹 Cleaning stock_price_history")
                     await conn.execute("TRUNCATE stock_price_history RESTART IDENTITY")

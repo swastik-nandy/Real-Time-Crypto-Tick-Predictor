@@ -4,6 +4,16 @@
 # Folders
 /Ignore/
 /Analytics/
+/Backend/
+/dag_engine/
+/mlops/
+/Modelling/
+/assets/
+/Deployment/
+/data/target/
+
+
+
 
 # Python virtual environments
 /Backend/venv/
@@ -31,6 +41,7 @@ Thumbs.db
 **/.mypy_cache/
 **/__pycache__/
 /Analytics/*
+**/target/
 
 # Uvicorn, Fly.io, or local dev
 /Backend/*.log
@@ -45,3 +56,7 @@ dist/
 .env.local
 .env.production
 .env.development
+
+# Rust
+
+**/*.rs.bk
