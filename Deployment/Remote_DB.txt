@@ -1,3 +1,0 @@
-HOST=dpg-d1vqk7fdiees73buteog-a.ohio-postgres.render.com
-PASSWORD=4v09DJyTIVO3uQnQCrL4lc3FePosuEVq
-DB_NAME=triggerstock_db_3osv
