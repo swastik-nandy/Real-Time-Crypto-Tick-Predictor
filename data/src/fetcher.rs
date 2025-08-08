@@ -46,7 +46,7 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
         }
     });
 
-    // Symbol → id map
+    // Symbol → id map 
     let rows = pg_client
         .query("SELECT id, symbol FROM stocks", &[])
         .await
