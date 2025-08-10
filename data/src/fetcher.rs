@@ -15,7 +15,7 @@ use tokio::time::{sleep, timeout, Instant};
 // Postgres
 use tokio_postgres::{Client, Config};
 use tokio_postgres::config::SslMode;
-use tokio_postgres::tls::MakeTlsConnect; // ✅ correct public import
+use tokio_postgres::tls::MakeTlsConnect;
 use tokio_postgres::types::ToSql;
 
 // TLS for Postgres via rustls
@@ -27,8 +27,6 @@ const FETCH_INTERVAL_SECS: u64 = 10;
 const REDIS_OP_TIMEOUT: Duration = Duration::from_secs(3);
 const POSTGRES_OP_TIMEOUT: Duration = Duration::from_secs(5);
 const SLEEP_TICK: Duration = Duration::from_millis(100);
-
-// --- TLS + connect helpers ----------------------------------------------------
 
 fn build_tls() -> MakeRustlsConnect {
     let mut root_store = RootCertStore::empty();
@@ -52,7 +50,7 @@ fn pg_config_force_tls(url: &str) -> Config {
 
 async fn connect_pg_cfg<T>(cfg: &Config, tls: T) -> Client
 where
-    T: MakeTlsConnect<tokio_postgres::Socket> + Send + Sync + 'static,
+    T: MakeTlsConnect<tokio_postgres::Socket> + Send + Sync + Clone + 'static,
 {
     let mut attempt = 0u32;
     loop {
@@ -77,29 +75,23 @@ where
     }
 }
 
-// --- entrypoint ---------------------------------------------------------------
-
 pub async fn run(fetcher_running: Arc<AtomicBool>) {
     println!("🚀 Fetcher started");
     dotenv::dotenv().ok();
 
-    // Env
     let redis_url = env::var("REDIS_URL").expect("REDIS_URL not set");
     let pg_url = env::var("DATABASE_URL").expect("Postgres URL not set");
 
-    // Redis connection
     let redis_client = redis::Client::open(redis_url).expect("Invalid Redis URL");
     let mut redis = redis_client
         .get_multiplexed_async_connection()
         .await
         .expect("Redis connection failed");
 
-    // Postgres connection (TLS)
     let tls = build_tls();
     let cfg = pg_config_force_tls(&pg_url);
     let pg_client = connect_pg_cfg(&cfg, tls).await;
 
-    // Load stock_id map
     let rows = pg_client
         .query("SELECT id, symbol FROM stocks", &[])
         .await
@@ -121,7 +113,6 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
 
         let loop_start = Instant::now();
 
-        // 1) Get symbols
         let symbols: Vec<String> = match timeout(REDIS_OP_TIMEOUT, redis.smembers(SYMBOLS_KEY)).await {
             Ok(Ok(s)) => s,
             Ok(Err(err)) => {
@@ -138,7 +129,6 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
 
         if !fetcher_running.load(Ordering::Relaxed) { break; }
 
-        // 2) HGETALL pipeline
         let mut pipe = redis::pipe();
         for sym in &symbols {
             pipe.hgetall(format!("{OHLCV_PREFIX}{sym}"));
@@ -160,7 +150,6 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
 
         if !fetcher_running.load(Ordering::Relaxed) { break; }
 
-        // 3) Build batch
         let mut values: Vec<Box<dyn ToSql + Send + Sync>> = Vec::new();
         let mut placeholders = Vec::new();
         let mut idx = 1;
@@ -182,10 +171,11 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.naive_utc());
 
-            let (open, high, low, close, volume, updated_at) = match (open, high, low, close, volume, updated_at) {
-                (Some(o), Some(h), Some(l), Some(c), Some(v), Some(t)) => (o, h, l, c, v, t),
-                _ => continue,
-            };
+            let (open, high, low, close, volume, updated_at) =
+                match (open, high, low, close, volume, updated_at) {
+                    (Some(o), Some(h), Some(l), Some(c), Some(v), Some(t)) => (o, h, l, c, v, t),
+                    _ => continue,
+                };
 
             let stock_id = match stock_id_map.get(symbol) {
                 Some(id) => *id,
@@ -210,7 +200,6 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
 
         if !fetcher_running.load(Ordering::Relaxed) { break; }
 
-        // 4) Insert batch
         if !placeholders.is_empty() {
             let query = format!(
                 "INSERT INTO stock_price_history \
@@ -229,7 +218,6 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
             }
         }
 
-        // 5) Cooperative sleep
         let elapsed = loop_start.elapsed();
         if elapsed < Duration::from_secs(FETCH_INTERVAL_SECS) {
             coop_sleep(&fetcher_running, Duration::from_secs(FETCH_INTERVAL_SECS) - elapsed).await;
