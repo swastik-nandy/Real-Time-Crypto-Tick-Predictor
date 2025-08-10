@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, sync::Arc};
 use tokio_postgres::types::ToSql;
 
 // TLS for Postgres via rustls
@@ -15,13 +15,17 @@ pub async fn run() {
     // Build TLS config with native roots
     let mut root_store = RootCertStore::empty();
     for cert in load_native_certs().expect("Could not load platform certificates") {
+        // NOTE: pass by reference
         root_store.add(&cert).unwrap();
     }
+
     let tls_config = ClientConfig::builder()
         .with_safe_defaults()
         .with_root_certificates(root_store)
         .with_no_client_auth();
-    let tls = MakeTlsConnect::new(tls_config);
+
+    // NOTE: most versions expect Arc<ClientConfig>
+    let tls = MakeTlsConnect::new(Arc::new(tls_config));
 
     let (client, connection) = tokio_postgres::connect(&pg_url, tls)
         .await
@@ -33,12 +37,13 @@ pub async fn run() {
         }
     });
 
-    match client.execute("TRUNCATE TABLE stock_price_history", &[] as &[&(dyn ToSql + Sync)]).await {
+    // You can just pass &[]
+    match client.execute("TRUNCATE TABLE stock_price_history", &[]).await {
         Ok(_) => println!("✅ TRUNCATE succeeded"),
         Err(e) => eprintln!("❌ TRUNCATE failed: {e}"),
     }
 
-    match client.execute("VACUUM stock_price_history", &[] as &[&(dyn ToSql + Sync)]).await {
+    match client.execute("VACUUM stock_price_history", &[]).await {
         Ok(_) => println!("✅ VACUUM succeeded"),
         Err(e) => eprintln!("❌ VACUUM failed: {e}"),
     }

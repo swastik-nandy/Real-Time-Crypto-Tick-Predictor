@@ -49,7 +49,8 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
         .with_safe_defaults()
         .with_root_certificates(root_store)
         .with_no_client_auth();
-    let tls = MakeTlsConnect::new(tls_config);
+    // Most versions expect Arc<ClientConfig>
+    let tls = MakeTlsConnect::new(Arc::new(tls_config));
 
     // Connect Postgres over TLS
     let (pg_client, pg_connection) = tokio_postgres::connect(&pg_url, tls)
@@ -87,8 +88,8 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
         // 1) Get symbols
         let symbols: Vec<String> = match timeout(REDIS_OP_TIMEOUT, redis.smembers(SYMBOLS_KEY)).await {
             Ok(Ok(s)) => s,
-            Ok(Err e) => { eprintln!("❌ Redis smembers: {e}"); coop_sleep(&fetcher_running, Duration::from_secs(1)).await; continue; }
-            Err(_)    => { eprintln!("⏱️ Redis smembers timed out"); coop_sleep(&fetcher_running, Duration::from_secs(1)).await; continue; }
+            Ok(Err e)) => { eprintln!("❌ Redis smembers: {e}"); coop_sleep(&fetcher_running, Duration::from_secs(1)).await; continue; }
+            Err(_)     => { eprintln!("⏱️ Redis smembers timed out"); coop_sleep(&fetcher_running, Duration::from_secs(1)).await; continue; }
         };
 
         if !fetcher_running.load(Ordering::Relaxed) { break; }
@@ -99,9 +100,9 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
             pipe.hgetall(format!("{OHLCV_PREFIX}{sym}"));
         }
         let results: Vec<HashMap<String, String>> = match timeout(REDIS_OP_TIMEOUT, pipe.query_async(&mut redis)).await {
-            Ok(Ok r) => r,
-            Ok(Err e) => { eprintln!("❌ Redis pipeline: {e}"); coop_sleep(&fetcher_running, Duration::from_secs(1)).await; continue; }
-            Err(_)    => { eprintln!("⏱️ Redis pipeline timed out"); coop_sleep(&fetcher_running, Duration::from_secs(1)).await; continue; }
+            Ok(Ok(r)) => r,
+            Ok(Err e)) => { eprintln!("❌ Redis pipeline: {e}"); coop_sleep(&fetcher_running, Duration::from_secs(1)).await; continue; }
+            Err(_)     => { eprintln!("⏱️ Redis pipeline timed out"); coop_sleep(&fetcher_running, Duration::from_secs(1)).await; continue; }
         };
 
         if !fetcher_running.load(Ordering::Relaxed) { break; }
@@ -169,8 +170,8 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
                 values.iter().map(|v| v.as_ref() as &(dyn ToSql + Sync)).collect();
 
             match timeout(POSTGRES_OP_TIMEOUT, pg_client.execute(&query, &params)).await {
-                Ok(Ok count)) => println!("✅ Inserted {} rows at {}", count, Utc::now().format("%H:%M:%S")),
-                Ok(Err e)     => eprintln!("❌ Postgres insert: {e}"),
+                Ok(Ok(count)) => println!("✅ Inserted {} rows at {}", count, Utc::now().format("%H:%M:%S")),
+                Ok(Err e))    => eprintln!("❌ Postgres insert: {e}"),
                 Err(_)        => eprintln!("⏱️ Postgres insert timed out"),
             }
         }
