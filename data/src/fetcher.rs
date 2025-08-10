@@ -11,11 +11,14 @@ use std::{
 use chrono::{DateTime, Utc};
 use redis::AsyncCommands;
 use tokio::time::{sleep, timeout, Instant};
+
+use tokio_postgres::{Client, Config};
+use tokio_postgres::config::SslMode;
 use tokio_postgres::types::ToSql;
 
-// postgres + rustls
-use postgres_rustls::{MakeTlsConnector, TlsConnector, set_postgresql_alpn};
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+// TLS for Postgres via rustls (0.21) + postgres_rustls (0.1.x)
+use postgres_rustls::MakeTlsConnect;
+use rustls::{ClientConfig, RootCertStore};
 use rustls_native_certs::load_native_certs;
 
 /// Tunables
@@ -24,17 +27,33 @@ const REDIS_OP_TIMEOUT: Duration = Duration::from_secs(3);
 const POSTGRES_OP_TIMEOUT: Duration = Duration::from_secs(5);
 const SLEEP_TICK: Duration = Duration::from_millis(100);
 
-fn with_ssl_require(url: &str) -> String {
-    if url.contains("sslmode=") { url.to_string() }
-    else if url.contains('?') { format!("{url}&sslmode=require") }
-    else { format!("{url}?sslmode=require") }
+// --- TLS + connect helpers ----------------------------------------------------
+
+fn build_tls() -> MakeTlsConnect {
+    let mut root_store = RootCertStore::empty();
+    for cert in load_native_certs().expect("Could not load platform certs") {
+        root_store.add(&cert).expect("adding platform cert failed");
+    }
+    let tls_config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    MakeTlsConnect::new(Arc::new(tls_config))
 }
 
-async fn connect_pg(pg_url: &str, tls: MakeTlsConnector) -> tokio_postgres::Client {
+fn pg_config_force_tls(url: &str) -> Config {
+    use std::str::FromStr;
+    let mut cfg = Config::from_str(url).expect("Invalid DATABASE_URL");
+    cfg.ssl_mode(SslMode::Require);
+    cfg
+}
+
+async fn connect_pg_cfg(cfg: &Config, tls: &MakeTlsConnect) -> Client {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        match tokio_postgres::connect(pg_url, tls.clone()).await {
+        match cfg.connect(tls.clone()).await {
             Ok((client, connection)) => {
                 tokio::spawn(async move {
                     if let Err(e) = connection.await {
@@ -54,37 +73,27 @@ async fn connect_pg(pg_url: &str, tls: MakeTlsConnector) -> tokio_postgres::Clie
     }
 }
 
+// --- entrypoint ---------------------------------------------------------------
+
 pub async fn run(fetcher_running: Arc<AtomicBool>) {
     println!("🚀 Fetcher started");
     dotenv::dotenv().ok();
 
     // Env
     let redis_url = env::var("REDIS_URL").expect("REDIS_URL not set");
-    let mut pg_url = env::var("DATABASE_URL").expect("Postgres URL not set");
-    pg_url = with_ssl_require(&pg_url);
+    let pg_url = env::var("DATABASE_URL").expect("Postgres URL not set");
 
-    // Redis
+    // Redis (TLS from Cargo features)
     let redis_client = redis::Client::open(redis_url).expect("Invalid Redis URL");
     let mut redis = redis_client
         .get_multiplexed_async_connection()
         .await
         .expect("Redis connection failed");
 
-    // rustls config + native roots
-    let mut roots = RootCertStore::empty();
-    for cert in load_native_certs().expect("load platform certs") {
-        roots.add(cert).expect("add platform cert");
-    }
-    let mut cfg = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    set_postgresql_alpn(&mut cfg);
-
-    // Connector for tokio-postgres
-    let tls = MakeTlsConnector::new(TlsConnector::from(Arc::new(cfg)));
-
-    // Connect Postgres over TLS
-    let pg_client = connect_pg(&pg_url, tls).await;
+    // Postgres TLS + connect (forced SSL)
+    let tls = build_tls();
+    let cfg = pg_config_force_tls(&pg_url);
+    let pg_client = connect_pg_cfg(&cfg, &tls).await;
 
     // Symbol → id map
     let rows = pg_client
@@ -109,20 +118,11 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
         let loop_start = Instant::now();
 
         // 1) Get symbols
-        let symbols: Vec<String> =
-            match timeout(REDIS_OP_TIMEOUT, redis.smembers(SYMBOLS_KEY)).await {
-                Ok(Ok(s)) => s,
-                Ok(Err e) => {
-                    eprintln!("❌ Redis smembers: {e}");
-                    coop_sleep(&fetcher_running, Duration::from_secs(1)).await;
-                    continue;
-                }
-                Err(_) => {
-                    eprintln!("⏱️ Redis smembers timed out");
-                    coop_sleep(&fetcher_running, Duration::from_secs(1)).await;
-                    continue;
-                }
-            };
+        let symbols: Vec<String> = match timeout(REDIS_OP_TIMEOUT, redis.smembers(SYMBOLS_KEY)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err e) => { eprintln!("❌ Redis smembers: {e}"); coop_sleep(&fetcher_running, Duration::from_secs(1)).await; continue; }
+            Err(_)    => { eprintln!("⏱️ Redis smembers timed out"); coop_sleep(&fetcher_running, Duration::from_secs(1)).await; continue; }
+        };
 
         if !fetcher_running.load(Ordering::Relaxed) { break; }
 
@@ -134,16 +134,8 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
         let results: Vec<HashMap<String, String>> =
             match timeout(REDIS_OP_TIMEOUT, pipe.query_async(&mut redis)).await {
                 Ok(Ok(r)) => r,
-                Ok(Err e) => {
-                    eprintln!("❌ Redis pipeline: {e}");
-                    coop_sleep(&fetcher_running, Duration::from_secs(1)).await;
-                    continue;
-                }
-                Err(_) => {
-                    eprintln!("⏱️ Redis pipeline timed out");
-                    coop_sleep(&fetcher_running, Duration::from_secs(1)).await;
-                    continue;
-                }
+                Ok(Err e) => { eprintln!("❌ Redis pipeline: {e}"); coop_sleep(&fetcher_running, Duration::from_secs(1)).await; continue; }
+                Err(_)    => { eprintln!("⏱️ Redis pipeline timed out"); coop_sleep(&fetcher_running, Duration::from_secs(1)).await; continue; }
             };
 
         if !fetcher_running.load(Ordering::Relaxed) { break; }
@@ -170,11 +162,10 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.naive_utc());
 
-            let (open, high, low, close, volume, updated_at) =
-                match (open, high, low, close, volume, updated_at) {
-                    (Some(o), Some(h), Some(l), Some(c), Some(v), Some(t)) => (o, h, l, c, v, t),
-                    _ => continue,
-                };
+            let (open, high, low, close, volume, updated_at) = match (open, high, low, close, volume, updated_at) {
+                (Some(o), Some(h), Some(l), Some(c), Some(v), Some(t)) => (o, h, l, c, v, t),
+                _ => continue,
+            };
 
             let stock_id = match stock_id_map.get(symbol) {
                 Some(id) => *id,
@@ -212,11 +203,9 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
                 values.iter().map(|v| v.as_ref() as &(dyn ToSql + Sync)).collect();
 
             match timeout(POSTGRES_OP_TIMEOUT, pg_client.execute(&query, &params)).await {
-                Ok(Ok(count)) => {
-                    println!("✅ Inserted {} rows at {}", count, Utc::now().format("%H:%M:%S"))
-                }
-                Ok(Err e) => eprintln!("❌ Postgres insert: {e}"),
-                Err(_) => eprintln!("⏱️ Postgres insert timed out"),
+                Ok(Ok(count)) => println!("✅ Inserted {} rows at {}", count, Utc::now().format("%H:%M:%S")),
+                Ok(Err e)     => eprintln!("❌ Postgres insert: {e}"),
+                Err(_)        => eprintln!("⏱️ Postgres insert timed out"),
             }
         }
 
