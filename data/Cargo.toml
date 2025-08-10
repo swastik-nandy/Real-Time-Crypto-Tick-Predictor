@@ -16,8 +16,9 @@ url = "2.5.4"
 # WebSocket client over Rustls (uses native OS root certs)
 tokio-tungstenite = { version = "0.20", features = ["rustls-tls-native-roots"] }
 
-# Redis with Rustls TLS over Tokio  (FIXED feature name)
-redis = { version = "0.25", features = ["tokio-comp", "tls-rustls"] }
+# Redis with Rustls TLS over Tokio
+redis = { version = "0.25.4", features = ["tokio-comp", "tls-rustls"] }
+tokio-rustls = "0.24"          # <-- required so redis’s rustls TLS compiles (matches rustls 0.21)
 
 # Postgres + chrono + Rustls TLS
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
