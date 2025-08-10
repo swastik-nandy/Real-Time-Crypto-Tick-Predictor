@@ -9,35 +9,37 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use futures::stream::StreamExt;
-use redis::{aio::ConnectionLike, AsyncCommands, Client as RedisClient, RedisResult};
+use redis::AsyncCommands;
 use tokio::time::{sleep, timeout};
 
-// Postgres TLS
-use tokio_postgres::{Client as PgClient, Config, NoTls, types::ToSql};
-use tokio_postgres::config::SslMode;
-use postgres_rustls::MakeRustlsConnect;
+// ------------------------------------- Postgres -----------------------------------------
+use tokio_postgres::{config::SslMode, types::ToSql, Client as PgClient, Config};
+
+// ------------- TLS for Postgres via rustls (postgres_rustls 0.1.3 API) -------------------
+use postgres_rustls::MakeTlsConnector;
 use rustls::{ClientConfig, RootCertStore};
 use rustls_native_certs::load_native_certs;
+use tokio_rustls::TlsConnector;
 
 const FETCH_INTERVAL: Duration = Duration::from_secs(10);
 const REDIS_TIMEOUT: Duration = Duration::from_secs(3);
 const POSTGRES_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Build a rustls TLS connector for Postgres
-fn build_pg_tls() -> MakeRustlsConnect {
-    let mut root_store = RootCertStore::empty();
-    for cert in load_native_certs().expect("Could not load platform certs") {
-        root_store.add(cert).expect("Invalid cert");
+fn build_pg_tls() -> MakeTlsConnector {
+    // Build root store from OS certs (rustls 0.23 API: add by value)
+    let mut roots = RootCertStore::empty();
+    for cert in load_native_certs().expect("load platform certs") {
+        roots.add(cert).expect("invalid platform cert");
     }
-    let tls_config = ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(root_store)
+
+    let cfg = ClientConfig::builder()
+        .with_root_certificates(roots)
         .with_no_client_auth();
-    MakeRustlsConnect::new(Arc::new(tls_config))
+
+    let connector = TlsConnector::from(Arc::new(cfg));
+    MakeTlsConnector::new(connector)
 }
 
-/// Parse DATABASE_URL into Config + force TLS
 fn pg_config_tls(url: &str) -> Config {
     use std::str::FromStr;
     let mut cfg = Config::from_str(url).expect("Invalid DATABASE_URL");
@@ -45,8 +47,7 @@ fn pg_config_tls(url: &str) -> Config {
     cfg
 }
 
-/// Connect to Postgres with retries
-async fn connect_pg(cfg: &Config, tls: MakeRustlsConnect) -> PgClient {
+async fn connect_pg(cfg: &Config, tls: MakeTlsConnector) -> PgClient {
     for attempt in 1..=5 {
         match cfg.connect(tls.clone()).await {
             Ok((client, conn)) => {
@@ -66,106 +67,112 @@ async fn connect_pg(cfg: &Config, tls: MakeRustlsConnect) -> PgClient {
     panic!("❌ Could not connect to Postgres after 5 attempts");
 }
 
-pub async fn run(fetcher_running: Arc<AtomicBool>) {
+pub async fn run(flag: Arc<AtomicBool>) {
     println!("🚀 Fetcher started");
-
     dotenv::dotenv().ok();
+
+    // REQUIRED for rustls 0.23 once per process (safe to call multiple times)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let redis_url = env::var("REDIS_URL").expect("REDIS_URL not set");
     let pg_url = env::var("DATABASE_URL").expect("DATABASE_URL not set");
 
-    // Connect Redis (auto TLS with rediss://)
-    let redis_client = RedisClient::open(redis_url).expect("Invalid Redis URL");
-    let mut redis_conn = redis_client
+    // ---------------- Redis (TLS auto via rediss://) ----------------
+    // With redis 0.32 + feature "tokio-rustls-comp", rediss:// negotiates TLS automatically.
+    let redis_client = redis::Client::open(redis_url).expect("Invalid Redis URL");
+    let mut redis = redis_client
         .get_multiplexed_async_connection()
         .await
         .expect("Redis connection failed");
 
-    // Connect Postgres TLS
+    // ---------------- Postgres (TLS via rustls) ---------------------
     let pg_tls = build_pg_tls();
     let pg_cfg = pg_config_tls(&pg_url);
-    let pg_client = connect_pg(&pg_cfg, pg_tls).await;
+    let pg = connect_pg(&pg_cfg, pg_tls).await;
 
-    // Load stock ID map
-    let rows = pg_client
+    // Preload symbol -> id
+    let rows = pg
         .query("SELECT id, symbol FROM stocks", &[])
         .await
-        .expect("Failed to load stock ID map");
-
-    let stock_id_map: HashMap<String, i32> = rows
-        .into_iter()
-        .map(|row| (row.get::<_, String>(1), row.get::<_, i32>(0)))
-        .collect();
+        .expect("load stock map");
+    let id_map: HashMap<String, i32> =
+        rows.into_iter().map(|r| (r.get::<_, String>(1), r.get::<_, i32>(0))).collect();
 
     const SYMBOLS_KEY: &str = "stock:symbols";
     const OHLCV_PREFIX: &str = "stock:ohlcv:";
 
-    while fetcher_running.load(Ordering::Relaxed) {
-        let symbols: Vec<String> = match timeout(REDIS_TIMEOUT, redis_conn.smembers(SYMBOLS_KEY)).await {
-            Ok(Ok(s)) => s,
+    while flag.load(Ordering::Relaxed) {
+        // 1) symbols
+        let symbols: Vec<String> = match timeout(REDIS_TIMEOUT, redis.smembers(SYMBOLS_KEY)).await {
+            Ok(Ok(v)) => v,
             _ => {
-                eprintln!("⚠️ Redis symbols fetch failed/timed out");
+                eprintln!("⚠️ Redis smembers failed/timed out");
                 sleep(Duration::from_secs(1)).await;
                 continue;
             }
         };
 
+        // 2) pipeline hgetall
         let mut pipe = redis::pipe();
-        for sym in &symbols {
-            pipe.hgetall(format!("{OHLCV_PREFIX}{sym}"));
+        for s in &symbols {
+            pipe.hgetall(format!("{OHLCV_PREFIX}{s}"));
         }
-
-        let results: Vec<HashMap<String, String>> =
-            match timeout(REDIS_TIMEOUT, pipe.query_async(&mut redis_conn)).await {
-                Ok(Ok(r)) => r,
+        let rows: Vec<HashMap<String, String>> =
+            match timeout(REDIS_TIMEOUT, pipe.query_async(&mut redis)).await {
+                Ok(Ok(v)) => v,
                 _ => {
-                    eprintln!("⚠️ Redis OHLCV fetch failed/timed out");
+                    eprintln!("⚠️ Redis pipeline failed/timed out");
                     sleep(Duration::from_secs(1)).await;
                     continue;
                 }
             };
 
+        // 3) build insert
         let mut values: Vec<Box<dyn ToSql + Send + Sync>> = Vec::new();
         let mut placeholders = Vec::new();
-        let mut idx = 1;
+        let mut i = 1;
 
-        for (symbol, map) in symbols.iter().zip(results) {
-            if map.is_empty() { continue; }
-
-            let parse_f = |k: &str| map.get(k).and_then(|s| s.parse::<f64>().ok());
-            let (o, h, l, c, v) = (
-                parse_f("open"),
-                parse_f("high"),
-                parse_f("low"),
-                parse_f("close"),
-                parse_f("volume"),
-            );
-
-            let updated_at = map.get("updated_at")
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.naive_utc());
-
-            if let (Some(o), Some(h), Some(l), Some(c), Some(v), Some(ts)) = (o, h, l, c, v, updated_at) {
-                if let Some(stock_id) = stock_id_map.get(symbol) {
-                    placeholders.push(format!(
-                        "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                        idx, idx + 1, idx + 2, idx + 3, idx + 4, idx + 5, idx + 6, idx + 7
-                    ));
-                    idx += 8;
-
-                    values.push(Box::new(*stock_id));
-                    values.push(Box::new(symbol.clone()));
-                    values.push(Box::new(o));
-                    values.push(Box::new(h));
-                    values.push(Box::new(l));
-                    values.push(Box::new(c));
-                    values.push(Box::new(v));
-                    values.push(Box::new(ts));
-                }
+        for (sym, map) in symbols.iter().zip(rows) {
+            if map.is_empty() {
+                continue;
             }
+
+            let num = |k: &str| map.get(k).and_then(|s| s.parse::<f64>().ok());
+            let (o, h, l, c, v) = (num("open"), num("high"), num("low"), num("close"), num("volume"));
+            let ts = map
+                .get("updated_at")
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.naive_utc());
+
+            let (o, h, l, c, v, ts) = match (o, h, l, c, v, ts) {
+                (Some(o), Some(h), Some(l), Some(c), Some(v), Some(ts)) => (o, h, l, c, v, ts),
+                _ => continue,
+            };
+
+            let stock_id = match id_map.get(sym) {
+                Some(&id) => id,
+                None => continue,
+            };
+
+            placeholders.push(format!(
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                i, i + 1, i + 2, i + 3, i + 4, i + 5, i + 6, i + 7
+            ));
+            i += 8;
+
+            values.push(Box::new(stock_id));
+            values.push(Box::new(sym.clone()));
+            values.push(Box::new(o));
+            values.push(Box::new(h));
+            values.push(Box::new(l));
+            values.push(Box::new(c));
+            values.push(Box::new(v));
+            values.push(Box::new(ts));
         }
 
+        // 4) insert
         if !placeholders.is_empty() {
-            let query = format!(
+            let sql = format!(
                 "INSERT INTO stock_price_history \
                  (stock_id, symbol, open, high, low, close, volume, trade_time_stamp) \
                  VALUES {}",
@@ -173,14 +180,15 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
             );
             let params: Vec<&(dyn ToSql + Sync)> = values.iter().map(|v| v.as_ref()).collect();
 
-            match timeout(POSTGRES_TIMEOUT, pg_client.execute(&query, &params)).await {
-                Ok(Ok(count)) => println!("✅ Inserted {} rows at {}", count, Utc::now()),
-                _ => eprintln!("⚠️ Postgres insert failed/timed out"),
+            match timeout(POSTGRES_TIMEOUT, pg.execute(&sql, &params)).await {
+                Ok(Ok(n)) => println!("✅ Inserted {} rows at {}", n, Utc::now().format("%H:%M:%S")),
+                Ok(Err(e)) => eprintln!("❌ Postgres insert error: {e}"),
+                Err(_) => eprintln!("⏱️ Postgres insert timed out"),
             }
         }
 
         sleep(FETCH_INTERVAL).await;
     }
 
-    println!("🛑 Fetcher stopped");
+    println!("🧹 Fetcher stopped");
 }
