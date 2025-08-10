@@ -11,16 +11,18 @@ use std::{
 use chrono::{DateTime, Utc};
 use redis::AsyncCommands;
 use tokio::time::{sleep, timeout, Instant};
+
+// Postgres
 use tokio_postgres::{Client, Config};
 use tokio_postgres::config::SslMode;
+use tokio_postgres::tls::MakeTlsConnect; // ✅ correct public import
 use tokio_postgres::types::ToSql;
 
-// TLS for Postgres via rustls (0.21) + postgres_rustls (0.1.x)
-use postgres_rustls::MakeTlsConnect;
+// TLS for Postgres via rustls
+use postgres_rustls::MakeRustlsConnect;
 use rustls::{ClientConfig, RootCertStore};
 use rustls_native_certs::load_native_certs;
 
-/// Tunables
 const FETCH_INTERVAL_SECS: u64 = 10;
 const REDIS_OP_TIMEOUT: Duration = Duration::from_secs(3);
 const POSTGRES_OP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -28,17 +30,17 @@ const SLEEP_TICK: Duration = Duration::from_millis(100);
 
 // --- TLS + connect helpers ----------------------------------------------------
 
-fn build_tls() -> MakeTlsConnect {
+fn build_tls() -> MakeRustlsConnect {
     let mut root_store = RootCertStore::empty();
     for cert in load_native_certs().expect("Could not load platform certs") {
-        root_store.add(&cert).expect("adding platform cert failed");
+        root_store.add(cert).expect("adding platform cert failed");
     }
     let tls_config = ClientConfig::builder()
         .with_safe_defaults()
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    MakeTlsConnect::new(Arc::new(tls_config))
+    MakeRustlsConnect::new(Arc::new(tls_config))
 }
 
 fn pg_config_force_tls(url: &str) -> Config {
@@ -48,7 +50,10 @@ fn pg_config_force_tls(url: &str) -> Config {
     cfg
 }
 
-async fn connect_pg_cfg(cfg: &Config, tls: &MakeTlsConnect) -> Client {
+async fn connect_pg_cfg<T>(cfg: &Config, tls: T) -> Client
+where
+    T: MakeTlsConnect<tokio_postgres::Socket> + Send + Sync + 'static,
+{
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -82,19 +87,19 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
     let redis_url = env::var("REDIS_URL").expect("REDIS_URL not set");
     let pg_url = env::var("DATABASE_URL").expect("Postgres URL not set");
 
-    // Redis (TLS from Cargo features)
+    // Redis connection
     let redis_client = redis::Client::open(redis_url).expect("Invalid Redis URL");
     let mut redis = redis_client
         .get_multiplexed_async_connection()
         .await
         .expect("Redis connection failed");
 
-    // Postgres TLS + connect (forced SSL)
+    // Postgres connection (TLS)
     let tls = build_tls();
     let cfg = pg_config_force_tls(&pg_url);
-    let pg_client = connect_pg_cfg(&cfg, &tls).await;
+    let pg_client = connect_pg_cfg(&cfg, tls).await;
 
-    // Symbol → id map
+    // Load stock_id map
     let rows = pg_client
         .query("SELECT id, symbol FROM stocks", &[])
         .await
@@ -223,8 +228,6 @@ pub async fn run(fetcher_running: Arc<AtomicBool>) {
                 Err(_)        => eprintln!("⏱️ Postgres insert timed out"),
             }
         }
-
-        if !fetcher_running.load(Ordering::Relaxed) { break; }
 
         // 5) Cooperative sleep
         let elapsed = loop_start.elapsed();
