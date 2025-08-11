@@ -4,13 +4,15 @@ FROM rust:1.88.0-slim AS builder
 WORKDIR /app
 COPY . .
 
-# No OpenSSL needed (we use rustls for Redis & Postgres TLS)
+# Install build dependencies, including OpenSSL for native-tls
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     pkg-config \
+    libssl-dev \
+    ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Make sure we have a reproducible build and strip symbols to reduce binary size
+# Strip symbols for smaller binaries
 ENV RUSTFLAGS="-C strip=symbols"
 
 # Build release binaries with lockfile
@@ -22,27 +24,24 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Copy Rust binaries (including fetcher)
+# Copy Rust binaries
 COPY --from=builder /app/target/release/trigger ./trigger
 COPY --from=builder /app/target/release/websocket ./websocket
 COPY --from=builder /app/target/release/fetcher ./fetcher
 
-# Copy runtime files (Python scripts, configs, requirements, etc.)
+# Copy project files
 COPY . .
 
-# Minimal runtime deps: CA certs for rustls, git for push.py
+# Install runtime dependencies, including OpenSSL for native-tls
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     ca-certificates \
     tzdata \
+    libssl3 \
  && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Optional: security best practice — run as non-root
-# RUN useradd -m -u 10001 appuser && chown -R appuser:appuser /app
-# USER appuser
 
 ENV PYTHONUNBUFFERED=1
 ENV LOG_LEVEL=DEBUG

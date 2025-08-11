@@ -3,6 +3,7 @@ use std::{collections::HashMap, env, time::Duration};
 use chrono::Utc;
 use dotenv::dotenv;
 use futures::{stream::StreamExt, SinkExt};
+use native_tls::TlsConnector;
 use redis::aio::MultiplexedConnection;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
@@ -11,8 +12,8 @@ use tokio::{
     sync::mpsc,
     time::{sleep, timeout, Instant},
 };
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::protocol::Message, Connector};
+use tungstenite::client::IntoClientRequest;
 
 const SYMBOLS_KEY: &str = "stock:symbols";
 const PRICE_PREFIX: &str = "stock:price:";
@@ -56,9 +57,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         println!("🌐 Attempting connection to Finnhub WebSocket...");
-        match connect_async(&ws_url).await {
+
+        let request = ws_url.clone().into_client_request()?;
+        let tls_connector = TlsConnector::new()?;
+        let connector = Connector::NativeTls(tls_connector);
+
+        match connect_async_tls_with_config(request, None, Some(connector)).await {
             Ok((mut ws_stream, _)) => {
-                println!("✅ WebSocket connected successfully.");
+                println!("✅ WebSocket connected successfully with default TLS.");
                 reconnect_delay = Duration::from_secs(3);
                 let mut last_symbols = Vec::new();
 
@@ -149,7 +155,6 @@ async fn periodic_ohlcv_flush(
         let start = Instant::now();
         let mut trades_received = 0;
 
-        // Pull trades for 10 seconds in small intervals
         while start.elapsed() < Duration::from_secs(10) {
             match timeout(Duration::from_millis(200), rx.recv()).await {
                 Ok(Some(trade)) => {
@@ -178,8 +183,8 @@ async fn periodic_ohlcv_flush(
 
                     ohlcv_buffer.entry(symbol.clone()).or_default().push(trade);
                 }
-                Ok(None) => break, // Channel closed
-                Err(_) => continue, // Timeout waiting for new trade
+                Ok(None) => break,
+                Err(_) => continue,
             }
         }
 

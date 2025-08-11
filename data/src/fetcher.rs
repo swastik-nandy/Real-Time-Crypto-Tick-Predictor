@@ -15,28 +15,18 @@ use tokio::time::{sleep, timeout};
 // ------------------------------------- Postgres -----------------------------------------
 use tokio_postgres::{config::SslMode, types::ToSql, Client as PgClient, Config};
 
-// ------------- TLS for Postgres via rustls (postgres_rustls 0.1.3 API) -------------------
-use postgres_rustls::MakeTlsConnector;
-use rustls::{ClientConfig, RootCertStore};
-use rustls_native_certs::load_native_certs;
-use tokio_rustls::TlsConnector;
+// ------------- TLS for Postgres via native-tls -------------------
+use postgres_native_tls::MakeTlsConnector;
+use native_tls::TlsConnector;
 
 const FETCH_INTERVAL: Duration = Duration::from_secs(10);
 const REDIS_TIMEOUT: Duration = Duration::from_secs(3);
 const POSTGRES_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn build_pg_tls() -> MakeTlsConnector {
-    // Build root store from OS certs (rustls 0.23 API: add by value)
-    let mut roots = RootCertStore::empty();
-    for cert in load_native_certs().expect("load platform certs") {
-        roots.add(cert).expect("invalid platform cert");
-    }
-
-    let cfg = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-
-    let connector = TlsConnector::from(Arc::new(cfg));
+    let connector = TlsConnector::builder()
+        .build()
+        .expect("Failed to create native-tls connector");
     MakeTlsConnector::new(connector)
 }
 
@@ -71,21 +61,17 @@ pub async fn run(flag: Arc<AtomicBool>) {
     println!("🚀 Fetcher started");
     dotenv::dotenv().ok();
 
-    // REQUIRED for rustls 0.23 once per process (safe to call multiple times)
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
     let redis_url = env::var("REDIS_URL").expect("REDIS_URL not set");
     let pg_url = env::var("DATABASE_URL").expect("DATABASE_URL not set");
 
-    // ---------------- Redis (TLS auto via rediss://) ----------------
-    // With redis 0.32 + feature "tokio-rustls-comp", rediss:// negotiates TLS automatically.
+    // ---------------- Redis ----------------
     let redis_client = redis::Client::open(redis_url).expect("Invalid Redis URL");
     let mut redis = redis_client
         .get_multiplexed_async_connection()
         .await
         .expect("Redis connection failed");
 
-    // ---------------- Postgres (TLS via rustls) ---------------------
+    // ---------------- Postgres (TLS via native-tls) ---------------------
     let pg_tls = build_pg_tls();
     let pg_cfg = pg_config_tls(&pg_url);
     let pg = connect_pg(&pg_cfg, pg_tls).await;

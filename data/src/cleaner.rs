@@ -1,27 +1,20 @@
-use std::{env, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Duration};
-
+use std::{env, time::Duration};
 use tokio::time::sleep;
+
+// Postgres + native-tls
 use tokio_postgres::{config::SslMode, Client as PgClient, Config};
+use postgres_native_tls::MakeTlsConnector;
+use native_tls::TlsConnector;
 
-// ----------------------------- TLS for Postgres via rustls ---------------------------------------
-
-use postgres_rustls::MakeTlsConnector;
-use rustls::{ClientConfig, RootCertStore};
-use rustls_native_certs::load_native_certs;
-use tokio_rustls::TlsConnector;
-
+/// Build native-tls (OpenSSL) Postgres connector
 fn build_pg_tls() -> MakeTlsConnector {
-    let mut roots = RootCertStore::empty();
-    for cert in load_native_certs().expect("load platform certs") {
-        roots.add(cert).expect("invalid platform cert");
-    }
-    let cfg = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(cfg));
+    let connector = TlsConnector::builder()
+        .build()
+        .expect("Failed to create native-tls connector");
     MakeTlsConnector::new(connector)
 }
 
+/// Create Postgres config with TLS requirement
 fn pg_config_tls(url: &str) -> Config {
     use std::str::FromStr;
     let mut cfg = Config::from_str(url).expect("Invalid DATABASE_URL");
@@ -29,6 +22,7 @@ fn pg_config_tls(url: &str) -> Config {
     cfg
 }
 
+/// Attempt to connect to Postgres with retries
 async fn connect_pg(cfg: &Config, tls: MakeTlsConnector) -> PgClient {
     for attempt in 1..=5 {
         match cfg.connect(tls.clone()).await {
@@ -58,9 +52,7 @@ pub async fn run() {
     let cfg = pg_config_tls(&pg_url);
     let pg = connect_pg(&cfg, tls).await;
 
-    // ---------------------------------Do maintenance -------------------------
-
-
+    // --------------------------------- Maintenance -------------------------
     match pg.execute("TRUNCATE TABLE stock_price_history", &[]).await {
         Ok(_) => println!("✅ TRUNCATE succeeded"),
         Err(e) => eprintln!("❌ TRUNCATE failed: {e}"),
