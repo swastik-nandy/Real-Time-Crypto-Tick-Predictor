@@ -38,4 +38,4 @@ COPY . .
 ENV PYTHONUNBUFFERED=1 LOG_LEVEL=DEBUG
 
 # Start trigger and websocket together
-CMD ./trigger & ./websocket
+CMD ./trigger 
