@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
     sync::mpsc,
+    task::LocalSet,
     time::{sleep, timeout, Instant},
 };
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
@@ -31,16 +32,27 @@ struct TradeData {
     t: i64,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
+    let local = LocalSet::new();
 
+    local
+        .run_until(async {
+            if let Err(e) = run().await {
+                eprintln!("❌ Application error: {}", e);
+            }
+        })
+        .await;
+
+    Ok(())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = env::var("FINNHUB_API_KEY")?;
     let redis_url = env::var("REDIS_URL")?;
 
     // --- Auto-handle TLS for Redis ---
-    // If URL starts with "redis://" -> no TLS
-    // If URL starts with "rediss://" -> TLS
     let redis_client = if redis_url.starts_with("rediss://") {
         println!("🔐 Connecting to Redis with TLS...");
         redis::Client::open(redis_url)?
@@ -52,13 +64,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut redis = redis_client.get_multiplexed_async_connection().await?;
     println!("✅ Connected to Redis");
 
-    // WebSocket URL (TLS always)
+    // WebSocket URL
     let ws_url = url::Url::parse(&format!("wss://ws.finnhub.io?token={}", api_key))?;
 
     let (tx, mut rx) = mpsc::channel::<TradeData>(100_000);
-    let flush_client = redis_client.clone();
-    tokio::spawn(async move {
-        periodic_ohlcv_flush(flush_client, &mut rx).await;
+
+    // Spawn OHLCV flush in local task
+    tokio::task::spawn_local(async move {
+        periodic_ohlcv_flush(redis_client.clone(), &mut rx).await;
     });
 
     let mut reconnect_delay = Duration::from_secs(3);
@@ -73,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut last_symbols = Vec::new();
 
                 loop {
+                    // Refresh subscriptions
                     match redis.smembers::<_, Vec<String>>(SYMBOLS_KEY).await {
                         Ok(current_symbols) => {
                             if current_symbols != last_symbols {
@@ -102,6 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
+                    // Process incoming WebSocket messages
                     while let Some(msg) = ws_stream.next().await {
                         match msg {
                             Ok(Message::Text(text)) => {
@@ -110,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         if let Some(trades) = parsed.data {
                                             for trade in trades {
                                                 if tx.send(trade).await.is_err() {
-                                                    eprintln!("❌ Channel send error");
+                                                    eprintln!("⚠️ Dropped trade due to full channel buffer");
                                                 }
                                             }
                                         }
@@ -147,7 +162,8 @@ async fn periodic_ohlcv_flush(
     let mut ohlcv_buffer: HashMap<String, Vec<TradeData>> = HashMap::new();
 
     loop {
-        let mut redis: MultiplexedConnection = match client.get_multiplexed_async_connection().await {
+        let mut redis: MultiplexedConnection = match client.get_multiplexed_async_connection().await
+        {
             Ok(conn) => conn,
             Err(e) => {
                 eprintln!("❌ Redis reconnect error: {}", e);
@@ -174,16 +190,22 @@ async fn periodic_ohlcv_flush(
                         "updated_at": now
                     });
 
-                    let trade_fields: Vec<(String, String)> = trade_info.as_object().unwrap()
+                    let trade_fields: Vec<(String, String)> = trade_info
+                        .as_object()
+                        .unwrap()
                         .iter()
                         .map(|(k, v)| (k.clone(), v.to_string()))
                         .collect();
 
-                    let _ = redis.set::<_, _, ()>(format!("{}{}", PRICE_PREFIX, symbol), trade.p).await;
-                    let _ = redis.hset_multiple::<_, _, _, ()>(
-                        format!("{}{}", TRADE_PREFIX, symbol),
-                        &trade_fields
-                    ).await;
+                    let _ = redis
+                        .set::<_, _, ()>(format!("{}{}", PRICE_PREFIX, symbol), trade.p)
+                        .await;
+                    let _ = redis
+                        .hset_multiple::<_, _, _, ()>(
+                            format!("{}{}", TRADE_PREFIX, symbol),
+                            &trade_fields,
+                        )
+                        .await;
 
                     ohlcv_buffer.entry(symbol.clone()).or_default().push(trade);
                 }
@@ -218,15 +240,20 @@ async fn periodic_ohlcv_flush(
                     "updated_at": now
                 });
 
-                let redis_fields: Vec<(String, String)> = ohlcv.as_object().unwrap()
+                let redis_fields: Vec<(String, String)> = ohlcv
+                    .as_object()
+                    .unwrap()
                     .iter()
                     .map(|(k, v)| (k.clone(), v.to_string()))
                     .collect();
 
-                match redis.hset_multiple::<_, _, _, ()>(
-                    format!("{}{}", OHLCV_PREFIX, symbol),
-                    &redis_fields
-                ).await {
+                match redis
+                    .hset_multiple::<_, _, _, ()>(
+                        format!("{}{}", OHLCV_PREFIX, symbol),
+                        &redis_fields,
+                    )
+                    .await
+                {
                     Ok(_) => success_count += 1,
                     Err(e) => eprintln!("❌ OHLCV flush failed for {}: {}", symbol, e),
                 }
