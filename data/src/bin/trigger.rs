@@ -1,10 +1,10 @@
-use chrono::{NaiveDate, NaiveTime, Timelike, Utc};
+use chrono::{NaiveDate, NaiveTime, Utc};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 use tokio::{
-    task::{spawn_local, JoinHandle},
+    task::{spawn_local, JoinHandle, LocalSet},
     time::{sleep, timeout, Duration, Instant},
 };
 use data_collection::{cleaner, fetcher};
@@ -87,63 +87,69 @@ impl FetcherProc {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let mut fetcher = FetcherProc::new();
-    let mut last_cleaned: Option<NaiveDate> = None;
-    let mut last_pushed: Option<NaiveDate> = None;
+    let local = LocalSet::new();
 
-    loop {
-        let tick_start = Instant::now();
-        let now = Utc::now();
-        let today = now.date_naive();
-        let t = now.time();
+    local
+        .run_until(async {
+            let mut fetcher = FetcherProc::new();
+            let mut last_cleaned: Option<NaiveDate> = None;
+            let mut last_pushed: Option<NaiveDate> = None;
 
-        let in_window = t >= MAINT_START && t < MAINT_END;
+            loop {
+                let tick_start = Instant::now();
+                let now = Utc::now();
+                let today = now.date_naive();
+                let t = now.time();
 
-        //--------------------------------------GITHUB PUSH-------------------------------------------------
-        if in_window && t < CLEAN_TIME && last_pushed != Some(today) {
-            println!(
-                "📤 launching GitHub pusher at {}",
-                now.format("%Y-%m-%d %H:%M:%S UTC")
-            );
+                let in_window = t >= MAINT_START && t < MAINT_END;
 
-            let push_status = tokio::process::Command::new("python3")
-                .arg("scripts/push.py")
-                .output()
-                .await;
+                //--------------------------------------GITHUB PUSH-------------------------------------------------
+                if in_window && t < CLEAN_TIME && last_pushed != Some(today) {
+                    println!(
+                        "📤 launching GitHub pusher at {}",
+                        now.format("%Y-%m-%d %H:%M:%S UTC")
+                    );
 
-            match push_status {
-                Ok(o) if o.status.success() => println!("✅ GitHub push completed"),
-                Ok(o) => eprintln!(
-                    "❌ GitHub push failed:\n{}",
-                    String::from_utf8_lossy(&o.stderr)
-                ),
-                Err(e) => eprintln!("🚨 Failed to launch push.py: {e}"),
+                    let push_status = tokio::process::Command::new("python3")
+                        .arg("scripts/push.py")
+                        .output()
+                        .await;
+
+                    match push_status {
+                        Ok(o) if o.status.success() => println!("✅ GitHub push completed"),
+                        Ok(o) => eprintln!(
+                            "❌ GitHub push failed:\n{}",
+                            String::from_utf8_lossy(&o.stderr)
+                        ),
+                        Err(e) => eprintln!("🚨 Failed to launch push.py: {e}"),
+                    }
+
+                    last_pushed = Some(today);
+                }
+
+                // --------------------------------------CLEANER----------------------------------------
+                if in_window && t >= CLEAN_TIME && last_cleaned != Some(today) {
+                    println!("🧼 cleaner starting at {}", now.format("%Y-%m-%d %H:%M:%S UTC"));
+                    cleaner::run().await;
+                    last_cleaned = Some(today);
+                    println!("✅ cleaner completed via trigger.rs");
+                }
+
+                //--------------------------------FETCHER LIFECYCLE MANAGEMENT-----------------------------------------------
+                if in_window {
+                    if fetcher.is_running() {
+                        fetcher.stop().await;
+                    }
+                } else {
+                    if !fetcher.is_running() {
+                        fetcher.start().await;
+                    }
+                }
+
+                // --------------------------------DRIFT-CORRECTED SLEEP-----------------------------------------------------------
+                let elapsed = tick_start.elapsed();
+                sleep(LOOP_TICK.saturating_sub(elapsed)).await;
             }
-
-            last_pushed = Some(today);
-        }
-
-        // --------------------------------------CLEANER----------------------------------------
-        if in_window && t >= CLEAN_TIME && last_cleaned != Some(today) {
-            println!("🧼 cleaner starting at {}", now.format("%Y-%m-%d %H:%M:%S UTC"));
-            cleaner::run().await;
-            last_cleaned = Some(today);
-            println!("✅ cleaner completed via trigger.rs");
-        }
-
-        //--------------------------------FETCHER LIFECYCLE MANAGEMENT-----------------------------------------------
-        if in_window {
-            if fetcher.is_running() {
-                fetcher.stop().await;
-            }
-        } else {
-            if !fetcher.is_running() {
-                fetcher.start().await;
-            }
-        }
-
-        // --------------------------------DRIFT-CORRECTED SLEEP-----------------------------------------------------------
-        let elapsed = tick_start.elapsed();
-        sleep(LOOP_TICK.saturating_sub(elapsed)).await;
-    }
+        })
+        .await;
 }

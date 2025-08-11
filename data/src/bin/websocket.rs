@@ -1,16 +1,11 @@
 use std::{collections::HashMap, env, time::Duration};
 
-use chrono::Utc;
+use chrono::{Utc, TimeZone};
 use dotenv::dotenv;
 use futures::{stream::StreamExt, SinkExt};
-use redis::{aio::MultiplexedConnection, AsyncCommands};
+use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use tokio::{
-    sync::mpsc,
-    task::LocalSet,
-    time::{sleep, timeout, Instant},
-};
+use tokio::{task::LocalSet, time::sleep};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 const SYMBOLS_KEY: &str = "stock:symbols";
@@ -26,10 +21,10 @@ struct WebSocketMessage {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct TradeData {
-    s: String,
-    p: f64,
-    v: Option<f64>,
-    t: i64,
+    s: String,     // symbol
+    p: f64,        // price
+    v: Option<f64>,// volume
+    t: i64,        // trade time in ms since epoch
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -53,13 +48,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let redis_url = env::var("REDIS_URL")?;
 
     // --- Auto-handle TLS for Redis ---
-    let redis_client = if redis_url.starts_with("rediss://") {
+    let redis_client = redis::Client::open(redis_url.clone())?;
+    if redis_url.starts_with("rediss://") {
         println!("🔐 Connecting to Redis with TLS...");
-        redis::Client::open(redis_url)?
     } else {
         println!("🌐 Connecting to Redis without TLS...");
-        redis::Client::open(redis_url)?
-    };
+    }
 
     let mut redis = redis_client.get_multiplexed_async_connection().await?;
     println!("✅ Connected to Redis");
@@ -67,12 +61,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // WebSocket URL
     let ws_url = url::Url::parse(&format!("wss://ws.finnhub.io?token={}", api_key))?;
 
-    let (tx, mut rx) = mpsc::channel::<TradeData>(100_000);
-
-    // Spawn OHLCV flush in local task
-    tokio::task::spawn_local(async move {
-        periodic_ohlcv_flush(redis_client.clone(), &mut rx).await;
-    });
+    // OHLCV in-memory state: symbol -> (open, high, low, close, volume)
+    let mut ohlcv_map: HashMap<String, (f64, f64, f64, f64, f64)> = HashMap::new();
 
     let mut reconnect_delay = Duration::from_secs(3);
 
@@ -97,15 +87,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     continue;
                                 }
 
-                                println!("🔄 Updating subscriptions...");
+                                println!(
+                                    "🔄 Updating subscriptions for {} symbols...",
+                                    current_symbols.len()
+                                );
                                 for sym in &current_symbols {
-                                    let msg = json!({ "type": "subscribe", "symbol": sym }).to_string();
+                                    let msg =
+                                        format!(r#"{{"type":"subscribe","symbol":"{}"}}"#, sym);
                                     if let Err(e) = ws_stream.send(Message::Text(msg.into())).await {
                                         eprintln!("❌ Failed to subscribe {}: {}", sym, e);
-                                    } else {
-                                        println!("📡 Subscribed to {}", sym);
                                     }
-                                    sleep(Duration::from_millis(100)).await;
+                                    sleep(Duration::from_millis(50)).await;
                                 }
                             }
                         }
@@ -120,13 +112,90 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     while let Some(msg) = ws_stream.next().await {
                         match msg {
                             Ok(Message::Text(text)) => {
-                                if let Ok(parsed) = serde_json::from_str::<WebSocketMessage>(&text) {
+                                if let Ok(parsed) =
+                                    serde_json::from_str::<WebSocketMessage>(&text)
+                                {
                                     if parsed.r#type == "trade" {
                                         if let Some(trades) = parsed.data {
-                                            for trade in trades {
-                                                if tx.send(trade).await.is_err() {
-                                                    eprintln!("⚠️ Dropped trade due to full channel buffer");
+                                            let mut redis_conn = match redis_client
+                                                .get_multiplexed_async_connection()
+                                                .await
+                                            {
+                                                Ok(conn) => conn,
+                                                Err(e) => {
+                                                    eprintln!(
+                                                        "❌ Redis reconnect error: {}",
+                                                        e
+                                                    );
+                                                    continue;
                                                 }
+                                            };
+
+                                            for trade in trades {
+                                                let symbol = trade.s.clone();
+                                                let price = trade.p;
+                                                let volume = trade.v.unwrap_or(0.0);
+
+                                                // Convert Finnhub's trade.t (ms since epoch) to RFC3339
+                                                let trade_time = Utc.timestamp_millis_opt(trade.t)
+                                                    .single()
+                                                    .expect("Invalid trade timestamp");
+                                                let trade_time_str = trade_time.to_rfc3339();
+
+                                                // 1) Price + trade info
+                                                let _ = redis_conn
+                                                    .set::<_, _, ()>(
+                                                        format!("{}{}", PRICE_PREFIX, symbol),
+                                                        price,
+                                                    )
+                                                    .await;
+                                                let _ = redis_conn
+                                                    .hset_multiple::<_, _, _, ()>(
+                                                        format!("{}{}", TRADE_PREFIX, symbol),
+                                                        &[
+                                                            ("price".to_string(),
+                                                                price.to_string()),
+                                                            ("timestamp".to_string(),
+                                                                trade.t.to_string()),
+                                                            ("volume".to_string(),
+                                                                volume.to_string()),
+                                                            ("updated_at".to_string(),
+                                                                trade_time_str.clone()),
+                                                        ],
+                                                    )
+                                                    .await;
+
+                                                // 2) Update OHLCV state
+                                                let entry = ohlcv_map
+                                                    .entry(symbol.clone())
+                                                    .or_insert((
+                                                        price, // open
+                                                        price, // high
+                                                        price, // low
+                                                        price, // close
+                                                        0.0,   // volume
+                                                    ));
+                                                entry.1 = entry.1.max(price); // high
+                                                entry.2 = entry.2.min(price); // low
+                                                entry.3 = price; // close
+                                                entry.4 += volume; // volume
+
+                                                // 3) Immediate OHLCV flush to Redis
+                                                let fields = [
+                                                    ("open".to_string(), entry.0.to_string()),
+                                                    ("high".to_string(), entry.1.to_string()),
+                                                    ("low".to_string(), entry.2.to_string()),
+                                                    ("close".to_string(), entry.3.to_string()),
+                                                    ("volume".to_string(), entry.4.to_string()),
+                                                    ("updated_at".to_string(),
+                                                        trade_time_str.clone()),
+                                                ];
+                                                let _ = redis_conn
+                                                    .hset_multiple::<_, _, _, ()>(
+                                                        format!("{}{}", OHLCV_PREFIX, symbol),
+                                                        &fields,
+                                                    )
+                                                    .await;
                                             }
                                         }
                                     }
@@ -152,121 +221,5 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("⏳ Waiting {}s before retry...", reconnect_delay.as_secs());
         sleep(reconnect_delay).await;
         reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(60));
-    }
-}
-
-async fn periodic_ohlcv_flush(
-    client: redis::Client,
-    rx: &mut mpsc::Receiver<TradeData>,
-) {
-    let mut ohlcv_buffer: HashMap<String, Vec<TradeData>> = HashMap::new();
-
-    loop {
-        let mut redis: MultiplexedConnection = match client.get_multiplexed_async_connection().await
-        {
-            Ok(conn) => conn,
-            Err(e) => {
-                eprintln!("❌ Redis reconnect error: {}", e);
-                sleep(Duration::from_secs(3)).await;
-                continue;
-            }
-        };
-
-        let start = Instant::now();
-        let mut trades_received = 0;
-
-        while start.elapsed() < Duration::from_secs(10) {
-            match timeout(Duration::from_millis(200), rx.recv()).await {
-                Ok(Some(trade)) => {
-                    trades_received += 1;
-                    let symbol = &trade.s;
-                    let now = Utc::now().to_rfc3339();
-                    let volume = trade.v.unwrap_or(0.0);
-
-                    let trade_info = json!({
-                        "price": trade.p,
-                        "timestamp": trade.t,
-                        "volume": volume,
-                        "updated_at": now
-                    });
-
-                    let trade_fields: Vec<(String, String)> = trade_info
-                        .as_object()
-                        .unwrap()
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.to_string()))
-                        .collect();
-
-                    let _ = redis
-                        .set::<_, _, ()>(format!("{}{}", PRICE_PREFIX, symbol), trade.p)
-                        .await;
-                    let _ = redis
-                        .hset_multiple::<_, _, _, ()>(
-                            format!("{}{}", TRADE_PREFIX, symbol),
-                            &trade_fields,
-                        )
-                        .await;
-
-                    ohlcv_buffer.entry(symbol.clone()).or_default().push(trade);
-                }
-                Ok(None) => break,
-                Err(_) => continue,
-            }
-        }
-
-        let now = Utc::now().to_rfc3339();
-
-        let flushed_symbols = if trades_received == 0 {
-            println!("⏳ No trades received → no OHLCV to flush");
-            0
-        } else {
-            println!("🔄 Flushing OHLCV for {} symbols", ohlcv_buffer.len());
-            let mut success_count = 0;
-
-            for (symbol, trades) in ohlcv_buffer.drain() {
-                if trades.is_empty() {
-                    continue;
-                }
-
-                let prices: Vec<f64> = trades.iter().map(|t| t.p).collect();
-                let volumes: Vec<f64> = trades.iter().map(|t| t.v.unwrap_or(0.0)).collect();
-
-                let ohlcv = json!({
-                    "open": prices.first().unwrap(),
-                    "high": prices.iter().cloned().fold(f64::MIN, f64::max),
-                    "low": prices.iter().cloned().fold(f64::MAX, f64::min),
-                    "close": prices.last().unwrap(),
-                    "volume": volumes.iter().sum::<f64>(),
-                    "updated_at": now
-                });
-
-                let redis_fields: Vec<(String, String)> = ohlcv
-                    .as_object()
-                    .unwrap()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.to_string()))
-                    .collect();
-
-                match redis
-                    .hset_multiple::<_, _, _, ()>(
-                        format!("{}{}", OHLCV_PREFIX, symbol),
-                        &redis_fields,
-                    )
-                    .await
-                {
-                    Ok(_) => success_count += 1,
-                    Err(e) => eprintln!("❌ OHLCV flush failed for {}: {}", symbol, e),
-                }
-            }
-
-            success_count
-        };
-
-        println!("✅ Successfully updated {} symbols to Redis", flushed_symbols);
-
-        let elapsed = start.elapsed();
-        if elapsed < Duration::from_secs(10) {
-            sleep(Duration::from_secs(10) - elapsed).await;
-        }
     }
 }
