@@ -8,7 +8,7 @@ A fully asynchronous, memory-efficient stock analytics platform for **real-time 
 
 Built using:
 
-- 🗪 **FastAPI + Redis + PostgreSQL**
+- 🗪 **Tokio(Rust) + Redis + PostgreSQL**
 - 🛁 **Finnhub WebSocket** streaming
 - ⚙️ **Micro-batched Redis pipeline**
 - 🧠 **Daily model retraining pipeline**
