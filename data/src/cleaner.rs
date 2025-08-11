@@ -53,7 +53,7 @@ pub async fn run() {
     let pg = connect_pg(&cfg, tls).await;
 
     // --------------------------------- Maintenance -------------------------
-    match pg.execute("TRUNCATE TABLE stock_price_history", &[]).await {
+    match pg.execute("TRUNCATE TABLE stock_price_history RESTART IDENTITY", &[]).await {
         Ok(_) => println!("✅ TRUNCATE succeeded"),
         Err(e) => eprintln!("❌ TRUNCATE failed: {e}"),
     }
