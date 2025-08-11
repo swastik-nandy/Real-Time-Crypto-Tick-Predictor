@@ -18,7 +18,14 @@ redis = { version = "0.32.5", features = ["tokio-comp", "tokio-native-tls-comp"]
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 postgres-types  = { version = "0.2", features = ["with-chrono-0_4"] }
 postgres-native-tls = "0.5"
+
+# TLS support (OpenSSL via native-tls)
 native-tls = "0.2"
+
+# WebSocket client with native-tls
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["native-tls"] }
+tungstenite = { version = "0.21", default-features = false, features = ["native-tls"] }
+url = "2.4"
 
 [profile.release]
 opt-level = 3
