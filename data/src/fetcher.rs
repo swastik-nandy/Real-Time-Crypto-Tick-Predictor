@@ -164,7 +164,9 @@ pub async fn run(flag: Arc<AtomicBool>) {
                  VALUES {}",
                 placeholders.join(", ")
             );
-            let params: Vec<&(dyn ToSql + Sync)> = values.iter().map(|v| v.as_ref()).collect();
+
+            // FIX: Match the trait bounds so Send + Sync is preserved
+            let params: Vec<&(dyn ToSql + Send + Sync)> = values.iter().map(|v| v.as_ref()).collect();
 
             match timeout(POSTGRES_TIMEOUT, pg.execute(&sql, &params)).await {
                 Ok(Ok(n)) => println!("✅ Inserted {} rows at {}", n, Utc::now().format("%H:%M:%S")),
