@@ -55,7 +55,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("🌐 Connecting to Redis without TLS...");
     }
 
-    let mut redis = redis_client.get_multiplexed_async_connection().await?;
+    // Persistent Redis connection
+    let mut redis_conn = connect_redis_with_retry(&redis_client).await;
+
     println!("✅ Connected to Redis");
 
     // WebSocket URL
@@ -77,7 +79,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 loop {
                     // Refresh subscriptions
-                    match redis.smembers::<_, Vec<String>>(SYMBOLS_KEY).await {
+                    match redis_conn.smembers::<_, Vec<String>>(SYMBOLS_KEY).await {
                         Ok(current_symbols) => {
                             if current_symbols != last_symbols {
                                 last_symbols = current_symbols.clone();
@@ -102,8 +104,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         Err(e) => {
-                            eprintln!("❌ Redis symbol fetch error: {}", e);
-                            sleep(Duration::from_secs(5)).await;
+                            eprintln!("❌ Redis symbol fetch error: {} — reconnecting...", e);
+                            redis_conn = connect_redis_with_retry(&redis_client).await;
                             continue;
                         }
                     }
@@ -117,55 +119,49 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 {
                                     if parsed.r#type == "trade" {
                                         if let Some(trades) = parsed.data {
-                                            let mut redis_conn = match redis_client
-                                                .get_multiplexed_async_connection()
-                                                .await
-                                            {
-                                                Ok(conn) => conn,
-                                                Err(e) => {
-                                                    eprintln!(
-                                                        "❌ Redis reconnect error: {}",
-                                                        e
-                                                    );
-                                                    continue;
-                                                }
-                                            };
-
                                             for trade in trades {
                                                 let symbol = trade.s.clone();
                                                 let price = trade.p;
                                                 let volume = trade.v.unwrap_or(0.0);
 
                                                 // Convert Finnhub's trade.t (ms since epoch) to RFC3339
-                                                let trade_time = Utc.timestamp_millis_opt(trade.t)
+                                                let trade_time = Utc
+                                                    .timestamp_millis_opt(trade.t)
                                                     .single()
                                                     .expect("Invalid trade timestamp");
                                                 let trade_time_str = trade_time.to_rfc3339();
 
-                                                // 1) Price + trade info
-                                                let _ = redis_conn
+                                                // --- Redis writes ---
+                                                if let Err(e) = redis_conn
                                                     .set::<_, _, ()>(
                                                         format!("{}{}", PRICE_PREFIX, symbol),
                                                         price,
                                                     )
-                                                    .await;
-                                                let _ = redis_conn
+                                                    .await
+                                                {
+                                                    eprintln!("❌ Redis SET error: {} — reconnecting...", e);
+                                                    redis_conn = connect_redis_with_retry(&redis_client).await;
+                                                    continue;
+                                                }
+
+                                                if let Err(e) = redis_conn
                                                     .hset_multiple::<_, _, _, ()>(
                                                         format!("{}{}", TRADE_PREFIX, symbol),
                                                         &[
-                                                            ("price".to_string(),
-                                                                price.to_string()),
-                                                            ("timestamp".to_string(),
-                                                                trade.t.to_string()),
-                                                            ("volume".to_string(),
-                                                                volume.to_string()),
-                                                            ("updated_at".to_string(),
-                                                                trade_time_str.clone()),
+                                                            ("price".to_string(), price.to_string()),
+                                                            ("timestamp".to_string(), trade.t.to_string()),
+                                                            ("volume".to_string(), volume.to_string()),
+                                                            ("updated_at".to_string(), trade_time_str.clone()),
                                                         ],
                                                     )
-                                                    .await;
+                                                    .await
+                                                {
+                                                    eprintln!("❌ Redis HSET trade error: {} — reconnecting...", e);
+                                                    redis_conn = connect_redis_with_retry(&redis_client).await;
+                                                    continue;
+                                                }
 
-                                                // 2) Update OHLCV state
+                                                // Update OHLCV state
                                                 let entry = ohlcv_map
                                                     .entry(symbol.clone())
                                                     .or_insert((
@@ -180,22 +176,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                                 entry.3 = price; // close
                                                 entry.4 += volume; // volume
 
-                                                // 3) Immediate OHLCV flush to Redis
-                                                let fields = [
-                                                    ("open".to_string(), entry.0.to_string()),
-                                                    ("high".to_string(), entry.1.to_string()),
-                                                    ("low".to_string(), entry.2.to_string()),
-                                                    ("close".to_string(), entry.3.to_string()),
-                                                    ("volume".to_string(), entry.4.to_string()),
-                                                    ("updated_at".to_string(),
-                                                        trade_time_str.clone()),
-                                                ];
-                                                let _ = redis_conn
+                                                // Immediate OHLCV flush
+                                                if let Err(e) = redis_conn
                                                     .hset_multiple::<_, _, _, ()>(
                                                         format!("{}{}", OHLCV_PREFIX, symbol),
-                                                        &fields,
+                                                        &[
+                                                            ("open".to_string(), entry.0.to_string()),
+                                                            ("high".to_string(), entry.1.to_string()),
+                                                            ("low".to_string(), entry.2.to_string()),
+                                                            ("close".to_string(), entry.3.to_string()),
+                                                            ("volume".to_string(), entry.4.to_string()),
+                                                            ("updated_at".to_string(), trade_time_str.clone()),
+                                                        ],
                                                     )
-                                                    .await;
+                                                    .await
+                                                {
+                                                    eprintln!("❌ Redis HSET OHLCV error: {} — reconnecting...", e);
+                                                    redis_conn = connect_redis_with_retry(&redis_client).await;
+                                                    continue;
+                                                }
                                             }
                                         }
                                     }
@@ -221,5 +220,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("⏳ Waiting {}s before retry...", reconnect_delay.as_secs());
         sleep(reconnect_delay).await;
         reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(60));
+    }
+}
+
+/// Persistent Redis connection with retry
+async fn connect_redis_with_retry(client: &redis::Client) -> redis::aio::MultiplexedConnection {
+    loop {
+        match client.get_multiplexed_async_connection().await {
+            Ok(conn) => {
+                println!("✅ Redis connection established");
+                return conn;
+            }
+            Err(e) => {
+                eprintln!("❌ Redis connection failed: {}, retrying in 3s...", e);
+                sleep(Duration::from_secs(3)).await;
+            }
+        }
     }
 }
