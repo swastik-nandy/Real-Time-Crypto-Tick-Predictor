@@ -4,7 +4,7 @@ use std::sync::{
     Arc,
 };
 use tokio::{
-    task::{JoinHandle, spawn_local},
+    task::{spawn_local, JoinHandle},
     time::{sleep, timeout, Duration, Instant},
 };
 use data_collection::{cleaner, fetcher};
@@ -85,7 +85,6 @@ impl FetcherProc {
 
 //-----------------------------------MAIN LOOP------------------------------------------------------------------
 
-// Must be current_thread for spawn_local to work
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut fetcher = FetcherProc::new();
@@ -108,7 +107,7 @@ async fn main() {
             );
 
             let push_status = tokio::process::Command::new("python3")
-                .arg("scripts/push.py") // adjust path if needed
+                .arg("scripts/push.py")
                 .output()
                 .await;
 

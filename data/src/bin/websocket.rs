@@ -3,17 +3,14 @@ use std::{collections::HashMap, env, time::Duration};
 use chrono::Utc;
 use dotenv::dotenv;
 use futures::{stream::StreamExt, SinkExt};
-use native_tls::TlsConnector;
-use redis::aio::MultiplexedConnection;
-use redis::AsyncCommands;
+use redis::{aio::MultiplexedConnection, AsyncCommands};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
     sync::mpsc,
     time::{sleep, timeout, Instant},
 };
-use tokio_tungstenite::{client_async_tls_with_config, tungstenite::protocol::Message, Connector};
-use tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 const SYMBOLS_KEY: &str = "stock:symbols";
 const PRICE_PREFIX: &str = "stock:price:";
@@ -37,18 +34,29 @@ struct TradeData {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
+
     let api_key = env::var("FINNHUB_API_KEY")?;
     let redis_url = env::var("REDIS_URL")?;
-    let ws_url = url::Url::parse(&format!("wss://ws.finnhub.io?token={}", api_key))?;
 
-    println!("🔗 Connecting to WS URL");
+    // --- Auto-handle TLS for Redis ---
+    // If URL starts with "redis://" -> no TLS
+    // If URL starts with "rediss://" -> TLS
+    let redis_client = if redis_url.starts_with("rediss://") {
+        println!("🔐 Connecting to Redis with TLS...");
+        redis::Client::open(redis_url)?
+    } else {
+        println!("🌐 Connecting to Redis without TLS...");
+        redis::Client::open(redis_url)?
+    };
 
-    let client = redis::Client::open(redis_url)?;
-    let mut redis = client.get_multiplexed_async_connection().await?;
+    let mut redis = redis_client.get_multiplexed_async_connection().await?;
     println!("✅ Connected to Redis");
 
+    // WebSocket URL (TLS always)
+    let ws_url = url::Url::parse(&format!("wss://ws.finnhub.io?token={}", api_key))?;
+
     let (tx, mut rx) = mpsc::channel::<TradeData>(100_000);
-    let flush_client = client.clone();
+    let flush_client = redis_client.clone();
     tokio::spawn(async move {
         periodic_ohlcv_flush(flush_client, &mut rx).await;
     });
@@ -58,13 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         println!("🌐 Attempting connection to Finnhub WebSocket...");
 
-        let request = ws_url.clone().into_client_request()?;
-        let tls_connector = TlsConnector::new()?;
-        let connector = Connector::NativeTls(tls_connector);
-
-        match client_async_tls_with_config(request, None, Some(connector)).await {
+        match connect_async(ws_url.clone()).await {
             Ok((mut ws_stream, _)) => {
-                println!("✅ WebSocket connected successfully with default TLS.");
+                println!("✅ WebSocket connected successfully.");
                 reconnect_delay = Duration::from_secs(3);
                 let mut last_symbols = Vec::new();
 

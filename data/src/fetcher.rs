@@ -11,55 +11,46 @@ use std::{
 use chrono::{DateTime, Utc};
 use redis::AsyncCommands;
 use tokio::time::{sleep, timeout};
+use tokio_postgres::NoTls;
 
-// ------------------------------------- Postgres -----------------------------------------
-use tokio_postgres::{config::SslMode, types::ToSql, Client as PgClient, Config};
-
-// ------------- TLS for Postgres via native-tls -------------------
 use postgres_native_tls::MakeTlsConnector;
 use native_tls::TlsConnector;
+use tokio_postgres::Client as PgClient;
+use tokio_postgres::types::ToSql;
 
 const FETCH_INTERVAL: Duration = Duration::from_secs(10);
 const REDIS_TIMEOUT: Duration = Duration::from_secs(3);
 const POSTGRES_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn build_pg_tls() -> MakeTlsConnector {
-    let connector = TlsConnector::builder()
-        .build()
-        .expect("Failed to create native-tls connector");
-    MakeTlsConnector::new(connector)
-}
+/// Auto-handle Postgres TLS (Render) or NoTLS (local)
+async fn connect_pg(pg_url: &str) -> PgClient {
+    let tls_connector = TlsConnector::new().expect("Failed to create TLS connector");
+    let tls = MakeTlsConnector::new(tls_connector);
 
-fn pg_config_tls(url: &str) -> Config {
-    use std::str::FromStr;
-    let mut cfg = Config::from_str(url).expect("Invalid DATABASE_URL");
-    cfg.ssl_mode(SslMode::Require);
-    cfg
-}
-
-/// Connect to Postgres without tokio::spawn, single-threaded async
-async fn connect_pg(cfg: &Config, tls: MakeTlsConnector) -> PgClient {
-    for attempt in 1..=5 {
-        match cfg.connect(tls.clone()).await {
-            Ok((client, mut connection)) => {
-                // Drive the connection in the same task
-                tokio::select! {
-                    _ = async {
-                        if let Err(e) = &mut connection.await {
-                            eprintln!("❌ Postgres connection error: {e}");
-                        }
-                    } => {},
-                    else => {}
+    match tokio_postgres::connect(pg_url, tls).await {
+        Ok((client, connection)) => {
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    eprintln!("❌ Postgres connection error: {}", e);
                 }
-                return client;
-            }
-            Err(e) => {
-                eprintln!("⚠️ Postgres connect failed (attempt {attempt}): {e}");
-                sleep(Duration::from_secs(2)).await;
-            }
+            });
+            println!("🔐 Connected to Postgres with TLS");
+            client
+        }
+        Err(e) => {
+            eprintln!("⚠️ TLS connection failed: {e}");
+            println!("🔓 Falling back to NoTLS...");
+            let (client, connection) = tokio_postgres::connect(pg_url, NoTls)
+                .await
+                .expect("NoTLS Postgres connection failed");
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    eprintln!("❌ Postgres connection error: {}", e);
+                }
+            });
+            client
         }
     }
-    panic!("❌ Could not connect to Postgres after 5 attempts");
 }
 
 pub async fn run(flag: Arc<AtomicBool>) {
@@ -76,10 +67,8 @@ pub async fn run(flag: Arc<AtomicBool>) {
         .await
         .expect("Redis connection failed");
 
-    // ---------------- Postgres (TLS via native-tls) ---------------------
-    let pg_tls = build_pg_tls();
-    let pg_cfg = pg_config_tls(&pg_url);
-    let pg = connect_pg(&pg_cfg, pg_tls).await;
+    // ---------------- Postgres (auto TLS) ---------------------
+    let pg = connect_pg(&pg_url).await;
 
     // Preload symbol -> id
     let rows = pg
