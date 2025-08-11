@@ -37,15 +37,20 @@ fn pg_config_tls(url: &str) -> Config {
     cfg
 }
 
+/// Connect to Postgres without tokio::spawn, single-threaded async
 async fn connect_pg(cfg: &Config, tls: MakeTlsConnector) -> PgClient {
     for attempt in 1..=5 {
         match cfg.connect(tls.clone()).await {
-            Ok((client, conn)) => {
-                tokio::spawn(async move {
-                    if let Err(e) = conn.await {
-                        eprintln!("❌ Postgres connection error: {e}");
-                    }
-                });
+            Ok((client, mut connection)) => {
+                // Drive the connection in the same task
+                tokio::select! {
+                    _ = async {
+                        if let Err(e) = &mut connection.await {
+                            eprintln!("❌ Postgres connection error: {e}");
+                        }
+                    } => {},
+                    else => {}
+                }
                 return client;
             }
             Err(e) => {
@@ -114,7 +119,7 @@ pub async fn run(flag: Arc<AtomicBool>) {
             };
 
         // 3) build insert
-        let mut values: Vec<Box<dyn ToSql + Send + Sync>> = Vec::new();
+        let mut values: Vec<Box<dyn ToSql + Sync>> = Vec::new(); // No Send bound
         let mut placeholders = Vec::new();
         let mut i = 1;
 
@@ -165,8 +170,8 @@ pub async fn run(flag: Arc<AtomicBool>) {
                 placeholders.join(", ")
             );
 
-            // FIX: Match the trait bounds so Send + Sync is preserved
-            let params: Vec<&(dyn ToSql + Send + Sync)> = values.iter().map(|v| v.as_ref()).collect();
+            let params: Vec<&(dyn ToSql + Sync)> =
+                values.iter().map(|v| v.as_ref() as &(dyn ToSql + Sync)).collect();
 
             match timeout(POSTGRES_TIMEOUT, pg.execute(&sql, &params)).await {
                 Ok(Ok(n)) => println!("✅ Inserted {} rows at {}", n, Utc::now().format("%H:%M:%S")),
