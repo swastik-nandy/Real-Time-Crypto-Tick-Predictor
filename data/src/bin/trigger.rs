@@ -11,9 +11,9 @@ use data_collection::{cleaner, fetcher};
 
 //------------------------------------CONFIG & CONSTRAINTS--------------------------------------------------------
 
-const MAINT_START: NaiveTime = NaiveTime::from_hms_opt(5, 0, 0).unwrap(); // 05:00–05:05 UTC
-const MAINT_END: NaiveTime = NaiveTime::from_hms_opt(5, 5, 0).unwrap();
-const CLEAN_TIME: NaiveTime = NaiveTime::from_hms_opt(5, 3, 0).unwrap(); // 05:02 UTC
+const MAINT_START: NaiveTime = NaiveTime::from_hms_opt(18, 50, 0).unwrap(); // 05:00–05:05 UTC
+const MAINT_END: NaiveTime = NaiveTime::from_hms_opt(19, 00, 0).unwrap();
+const CLEAN_TIME: NaiveTime = NaiveTime::from_hms_opt(18, 53, 0).unwrap(); // 05:02 UTC
 
 const LOOP_TICK: Duration = Duration::from_secs(2);
 const FETCHER_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
