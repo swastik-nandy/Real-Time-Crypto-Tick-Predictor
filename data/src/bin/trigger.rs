@@ -1,12 +1,10 @@
-// src/bin/trigger.rs
-
 use chrono::{NaiveDate, NaiveTime, Timelike, Utc};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 use tokio::{
-    task::JoinHandle,
+    task::{JoinHandle, spawn_local},
     time::{sleep, timeout, Duration, Instant},
 };
 use data_collection::{cleaner, fetcher};
@@ -14,13 +12,12 @@ use data_collection::{cleaner, fetcher};
 //------------------------------------CONFIG & CONSTRAINTS--------------------------------------------------------
 
 const MAINT_START: NaiveTime = NaiveTime::from_hms_opt(5, 0, 0).unwrap(); // 05:00–05:05 UTC
-const MAINT_END:   NaiveTime = NaiveTime::from_hms_opt(5, 5, 0).unwrap();
-const CLEAN_TIME:  NaiveTime = NaiveTime::from_hms_opt(5, 3, 0).unwrap(); // 05:02 UTC
+const MAINT_END: NaiveTime = NaiveTime::from_hms_opt(5, 5, 0).unwrap();
+const CLEAN_TIME: NaiveTime = NaiveTime::from_hms_opt(5, 3, 0).unwrap(); // 05:02 UTC
 
 const LOOP_TICK: Duration = Duration::from_secs(2);
 const FETCHER_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const RESTART_DEBOUNCE: Duration = Duration::from_secs(3);
-
 
 // -----------------------------------FETCHER PROCESS STRUCTURE------------------------------------------------------------------------------
 
@@ -55,7 +52,7 @@ impl FetcherProc {
         }
         self.flag.store(true, Ordering::Relaxed);
         let flag = self.flag.clone();
-        self.handle = Some(tokio::spawn(async move {
+        self.handle = Some(spawn_local(async move {
             let _ = fetcher::run(flag).await;
         }));
         self.last_start = Some(Instant::now());
@@ -76,7 +73,10 @@ impl FetcherProc {
                     }
                 }
                 Err(_) => {
-                    eprintln!("⏳ fetcher didn’t stop in {:?}; force-abort", FETCHER_JOIN_TIMEOUT);
+                    eprintln!(
+                        "⏳ fetcher didn’t stop in {:?}; force-abort",
+                        FETCHER_JOIN_TIMEOUT
+                    );
                 }
             }
         }
@@ -85,7 +85,8 @@ impl FetcherProc {
 
 //-----------------------------------MAIN LOOP------------------------------------------------------------------
 
-#[tokio::main]
+// Must be current_thread for spawn_local to work
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut fetcher = FetcherProc::new();
     let mut last_cleaned: Option<NaiveDate> = None;
@@ -99,11 +100,12 @@ async fn main() {
 
         let in_window = t >= MAINT_START && t < MAINT_END;
 
-    
-//--------------------------------------GITHUB PUSH-------------------------------------------------
-
+        //--------------------------------------GITHUB PUSH-------------------------------------------------
         if in_window && t < CLEAN_TIME && last_pushed != Some(today) {
-            println!("📤 launching GitHub pusher at {}", now.format("%Y-%m-%d %H:%M:%S UTC"));
+            println!(
+                "📤 launching GitHub pusher at {}",
+                now.format("%Y-%m-%d %H:%M:%S UTC")
+            );
 
             let push_status = tokio::process::Command::new("python3")
                 .arg("scripts/push.py") // adjust path if needed
@@ -112,15 +114,17 @@ async fn main() {
 
             match push_status {
                 Ok(o) if o.status.success() => println!("✅ GitHub push completed"),
-                Ok(o) => eprintln!("❌ GitHub push failed:\n{}", String::from_utf8_lossy(&o.stderr)),
+                Ok(o) => eprintln!(
+                    "❌ GitHub push failed:\n{}",
+                    String::from_utf8_lossy(&o.stderr)
+                ),
                 Err(e) => eprintln!("🚨 Failed to launch push.py: {e}"),
             }
 
             last_pushed = Some(today);
         }
 
-// --------------------------------------CLEANER----------------------------------------
-
+        // --------------------------------------CLEANER----------------------------------------
         if in_window && t >= CLEAN_TIME && last_cleaned != Some(today) {
             println!("🧼 cleaner starting at {}", now.format("%Y-%m-%d %H:%M:%S UTC"));
             cleaner::run().await;
@@ -128,9 +132,7 @@ async fn main() {
             println!("✅ cleaner completed via trigger.rs");
         }
 
-        
-//--------------------------------FETCHER LIFECYCLE MANAGEMENT-----------------------------------------------
-
+        //--------------------------------FETCHER LIFECYCLE MANAGEMENT-----------------------------------------------
         if in_window {
             if fetcher.is_running() {
                 fetcher.stop().await;
@@ -141,9 +143,7 @@ async fn main() {
             }
         }
 
-    
-// --------------------------------DRIFT-CORRECTED SLEEP-----------------------------------------------------------
-
+        // --------------------------------DRIFT-CORRECTED SLEEP-----------------------------------------------------------
         let elapsed = tick_start.elapsed();
         sleep(LOOP_TICK.saturating_sub(elapsed)).await;
     }
