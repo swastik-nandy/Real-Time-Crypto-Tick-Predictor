@@ -12,7 +12,7 @@ use tokio::{
     sync::mpsc,
     time::{sleep, timeout, Instant},
 };
-use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::protocol::Message, Connector};
+use tokio_tungstenite::{client_async_tls_with_config, tungstenite::protocol::Message, Connector};
 use tungstenite::client::IntoClientRequest;
 
 const SYMBOLS_KEY: &str = "stock:symbols";
@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tls_connector = TlsConnector::new()?;
         let connector = Connector::NativeTls(tls_connector);
 
-        match connect_async_tls_with_config(request, None, Some(connector)).await {
+        match client_async_tls_with_config(request, None, Some(connector)).await {
             Ok((mut ws_stream, _)) => {
                 println!("✅ WebSocket connected successfully with default TLS.");
                 reconnect_delay = Duration::from_secs(3);
