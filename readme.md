@@ -1,146 +1,83 @@
 # **TRIGGERSTOCK**
 
-A fully asynchronous, memory-efficient stock analytics platform for **real-time price ingestion, prediction, and analytics**.
+A high-performance, real-time crypto analytics and prediction platform.  
+Built in **Rust** with full **data pipelines, multimodal ML, and MLOps** for intraday tick prediction.
 
 ---
 
 ## 🚀 Overview
 
-Built using:
-
-- 🗪 **Tokio(Rust) + Redis + PostgreSQL**
-- 🛁 **Finnhub WebSocket** streaming
-- ⚙️ **Micro-batched Redis pipeline**
-- 🧠 **Daily model retraining pipeline**
-- 🐳 **Dockerized microservices**
-- ☁️ Deployable on Fly.io, Northflank, Render, or any cloud VM
+- ⚡ **Rust async pipelines** (Tokio + Redis + Postgres) for low-latency ingestion  
+- 🌐 **Finnhub WebSocket** streaming ~160k+ rows/day at **<10ms latency**  
+- 🗄 **Redis → Postgres bridge** for persistence of OHLCV & trades  
+- 🧮 **DAG-based feature engine** (10+ TA indicators) generating >100k training samples  
+- 📰 **Transformer-based sentiment analysis** from Coindesk RSS, symbol-mapped  
+- 🤖 **Multimodal signal fusion** (price + volume + sentiment) via XGBoost + Transformers  
+- 📊 **Grafana dashboards** for real-time monitoring (latency, throughput, accuracy)  
+- ☁️ **Northflank Blue-Green deployments** with MLflow for experiment tracking & 99.9% uptime  
 
 ---
 
 ## 🧠 What It Does
 
-| Component                   | Description                                                                   |
-| --------------------------- | ----------------------------------------------------------------------------- |
-| ✅ `websocket.py`            | Connects to Finnhub WebSocket and pushes live prices into Redis (1ms latency) |
-| ✅ `fetcher.py`              | Every 10s, reads Redis and writes to Postgres `stock_price_history`           |
-| ✅ `trigger.py`              | Starts the fetcher only between 13:00 UTC and 21:00 UTC                       |
-| ✅ `cleaner.py`              | VACUUM FULL + TRUNCATE daily to keep Postgres lean                            |
-| 🔄 `model_trainer.py` (WIP) | Retrains XGBoost model daily on new data                                      |
-| 🧪 `FastAPI backend` (WIP)  | Provides API for dashboard, alerts, and predictions                           |
+| Component                 | Description                                                                 |
+| ------------------------- | --------------------------------------------------------------------------- |
+| ✅ `ws_ingestor.rs`        | Connects to Finnhub WebSocket and streams live prices into Redis (<10ms)   |
+| ✅ `fetcher.rs`            | Periodically writes OHLCV from Redis into Postgres with TLS/NoTLS fallback |
+| ✅ `news_ingestor.rs`      | Collects Coindesk RSS, maps to symbols, stores JSON headlines in Redis      |
+| ✅ `dag_engine.rs`         | Computes 10+ TA indicators (RSI, MACD, VWAP, etc.) for training datasets   |
+| ✅ `xgboost_trainer.py`    | Trains tick prediction classifier, logged via MLflow                       |
+| ✅ `sentiment_model.py`    | Transformer-based sentiment scorer for financial news                      |
+| 🧪 `deployment/`           | Blue-Green deployment scripts with MLflow model registry + Northflank CI   |
 
 ---
 
 ## 🏗 Architecture
 
-```
-         +------------+                 +-------------------+
-         |  Finnhub   |  <--WebSocket-- |   websocket.py     |
-         +------------+                 +---------+---------+
-                                                   |
-                                                   ↓
-                                             +-----+-----+
-                                             |   Redis    |
-                                             +-----+-----+
-                                                   |
-                                         +---------+----------+
-                                         |     fetcher.py      |
-                                         |  (every 10 seconds) |
-                                         +---------+----------+
-                                                   ↓
-                                          +--------+--------+
-                                          |    PostgreSQL    |
-                                          | stock_price_history |
-                                          +------------------+
+```mermaid
+flowchart TD
+    A[Finnhub WebSocket] -->|Trades/OHLCV| B[ws_ingestor.rs]
+    B --> C[Redis]
+    C --> D[fetcher.rs]
+    D --> E[Postgres: stock_price_history]
+    C --> F[news_ingestor.rs]
+    F --> C
+    E --> G[dag_engine.rs]
+    C --> G
+    G --> H[xgboost_trainer.py + sentiment_model.py]
+    H --> I[MLflow Registry]
+    I --> J[Northflank Blue-Green Deployment]
+    J --> K[Grafana Monitoring]
 ```
 
 ---
 
 ## ⚙️ Tech Stack
 
-- 🐍 Python 3.11 (async-first)
-- 🔸 FastAPI (for APIs and triggers)
-- 📆 Redis (live price cache)
-- 📂 PostgreSQL (price history, model features)
-- 📉 XGBoost (ML model)
-- 🐳 Docker (per-service container builds)
-- 🧪 GitHub Actions (daily retrain, cleanup)
-- ☁️ Deploys easily on Fly.io, Northflank, Render
+- 🦀 Rust (Tokio, async, Redis, Postgres)  
+- 🐍 Python (XGBoost, Transformers, MLflow)  
+- 🗄 Redis + PostgreSQL (real-time + persistence)  
+- 📊 Grafana (real-time monitoring & dashboards)  
+- ☁️ Northflank (Blue-Green deployment, CI/CD, 99.9% uptime)  
 
 ---
 
-## 💻 Local Setup
+## 📈 Model Training
 
-### 1️⃣ Clone the Repo
-
-```bash
-git clone https://github.com/your-username/real-time-stock-analytics.git
-cd real-time-stock-analytics/Backend
-```
-
----
-
-### 2️⃣ Project Structure
-
-```
-Real-Time-Stock-Analytics/
-├── Backend/
-│   ├── services/
-│   │   ├── websocket.py
-│   │   ├── fetcher.py
-│   │   ├── trigger.py
-│   │   ├── cleaner.py
-│   ├── app/
-│   │   ├── core/config.py
-│   │   └── db/, models/, ...
-│   ├── requirements.txt
-│   └── .env
-├── images/
-│   ├── Dockerfile.websocket
-│   ├── Dockerfile.fetcher
-│   └── ...
-├── README.md
-```
-
----
-
-### 3️⃣ Environment Setup
-
-```bash
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
----
-
-### 4️⃣ Environment Variables (Dummy)
-
-```env
-FINNHUB_API_KEY=your_finnhub_key
-REDIS_URL=redis://localhost:6379
-DATABASE_URL=postgresql+asyncpg://user:pass@localhost:5432/dbname
-ENV=local
-```
-
----
-
-## 📈 Model Training (Coming Soon)
-
-- Uses **XGBoost** + **sliding window**
-- Daily retraining on past 7–10 days
-- Predicts short-term price trend
-- Metrics: **MSE**, **directional accuracy**
+- **XGBoost tick classifier** with DAG-engine features  
+- **Transformer sentiment fusion** for news-driven volatility  
+- Metrics tracked via MLflow: accuracy, F1, false-signal reduction (~18%)  
+- Continuous retraining + deployment with zero downtime  
 
 ---
 
 ## 🤝 Contributing
 
-PRs are welcome!\
-If you're interested in **real-time systems**, **stock modeling**, or **ML infra**, open an issue or contribute directly.
+PRs are welcome!  
+If you're interested in **real-time systems**, **crypto modeling**, or **ML infra**, open an issue or contribute directly.
 
 ---
 
 ## 📜 License
 
 MIT © 2025 Swastik Nandy
-

@@ -49,6 +49,7 @@ Thumbs.db
 /Backend/.fly/
 /tree.py
 /Analytics/
+/news/
 
 # NodeJS (if frontend exists here too)
 node_modules/
