@@ -42,7 +42,7 @@ flowchart TD
     D --> E[Postgres: stock_price_history]
     C --> F[news_ingestor.rs]
     F --> C
-    E --> G[dag_engine.rs]
+    E --> G[dag_engine]
     C --> G
     G --> H[xgboost_trainer.py + sentiment_model.py]
     H --> I[MLflow Registry]
