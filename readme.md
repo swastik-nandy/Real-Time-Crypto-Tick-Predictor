@@ -36,7 +36,7 @@ Built in **Rust** with full **data pipelines, multimodal ML, and MLOps** for int
 
 ```mermaid
 flowchart TD
-    A[Finnhub WebSocket] -->|Trades/OHLCV| B[ws_ingestor.rs]
+    A[Finnhub WebSocket] -->|Trades/OHLCV| B[websocket.rs]
     B --> C[Redis]
     C --> D[fetcher.rs]
     D --> E[Postgres: stock_price_history]
