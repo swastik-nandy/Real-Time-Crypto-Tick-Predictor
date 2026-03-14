@@ -58,7 +58,7 @@ flowchart TD
 - 🐍 Python (XGBoost, Transformers, MLflow)  
 - 🗄 Redis + PostgreSQL (real-time + persistence)  
 - 📊 Grafana (real-time monitoring & dashboards)  
-- ☁️ Northflank (Blue-Green deployment, CI/CD, 99.9% uptime)  
+- ☁️ Northflank (Blue-Green deployment, CI/CD, 90% uptime)  
 
 ---
 
